@@ -5,6 +5,9 @@ description = "Scientific problem probing and autonomous AI research agent"
 requires-python = ">=3.12"
 dependencies = []
 
+[project.scripts]
+pro2 = "pro2.cli:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=9.0",
