@@ -17,6 +17,7 @@ from pro2.config import AgentConfig, Objective
 from pro2.hypothesis import Hypothesis
 from pro2.problem import Problem
 from pro2.runner import run_command
+from pro2.security import IsolationError, SecurityConfig
 from pro2.util import safe_id, truncate
 
 
@@ -91,9 +92,15 @@ def _strip_fence(text: str) -> str:
 
 
 class AgentRunner:
-    def __init__(self, config: AgentConfig, artifacts_dir: str | Path) -> None:
+    def __init__(
+        self,
+        config: AgentConfig,
+        artifacts_dir: str | Path,
+        security: SecurityConfig | None = None,
+    ) -> None:
         self.config = config
         self.artifacts_dir = Path(artifacts_dir)
+        self.security = security
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
 
     def available_providers(self) -> list[str]:
@@ -128,6 +135,11 @@ class AgentRunner:
             raise AgentError(f"agent working directory does not exist: {cwd_path}")
 
         provider = self.resolve_provider()
+        if self.security is not None and self.security.enabled and provider == "http":
+            raise IsolationError(
+                "isolation is enabled but the http provider cannot run isolated; "
+                "use the opencode/claude/command providers or set security.enabled=false"
+            )
         timeout = timeout_seconds or self.config.timeout_seconds
         token = uuid.uuid4().hex[:10]
         label = f"agent-{safe_id(task)}-{token}"
@@ -188,6 +200,7 @@ class AgentRunner:
             label=label,
             env=env,
             stdin_text=prompt,
+            isolation=self.security,
         )
         text = run.stdout
         cost = 0.0
@@ -233,6 +246,7 @@ class AgentRunner:
             artifacts_dir=self.artifacts_dir,
             label=label,
             env={"PRO2_AGENT": "opencode"},
+            isolation=self.security,
         )
         text_parts: list[str] = []
         cost = 0.0
@@ -293,6 +307,7 @@ class AgentRunner:
             artifacts_dir=self.artifacts_dir,
             label=label,
             env={"PRO2_AGENT": "claude"},
+            isolation=self.security,
         )
         text = run.stdout
         error = run.error

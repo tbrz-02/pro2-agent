@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from pro2.security import SecurityConfig
 from pro2.util import deep_get
 
 
@@ -22,6 +23,8 @@ class MetricSpec:
     timeout_seconds: float = 300.0
     repeat: int = 1
     env: dict[str, str] = field(default_factory=dict)
+    divergence_regex: str | None = None
+    memory_limit_mb: int = 0
 
     def __post_init__(self) -> None:
         if not self.command.strip():
@@ -37,6 +40,13 @@ class MetricSpec:
             raise ValueError("repeat must be >= 1")
         if self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be > 0")
+        if self.divergence_regex:
+            try:
+                re.compile(self.divergence_regex)
+            except re.error as exc:
+                raise ValueError(f"invalid divergence_regex: {exc}") from exc
+        if self.memory_limit_mb < 0:
+            raise ValueError("memory_limit_mb must be >= 0")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -46,6 +56,8 @@ class MetricSpec:
             "timeout_seconds": self.timeout_seconds,
             "repeat": self.repeat,
             "env": dict(self.env),
+            "divergence_regex": self.divergence_regex,
+            "memory_limit_mb": self.memory_limit_mb,
         }
 
     @classmethod
@@ -57,6 +69,8 @@ class MetricSpec:
             timeout_seconds=float(data.get("timeout_seconds", 300)),
             repeat=int(data.get("repeat", 1)),
             env={str(k): str(v) for k, v in (data.get("env") or {}).items()},
+            divergence_regex=data.get("divergence_regex"),
+            memory_limit_mb=int(data.get("memory_limit_mb", 0)),
         )
 
 
@@ -129,12 +143,15 @@ class Budget:
     max_experiment_seconds: float = 600.0
     max_cost_usd: float = 0.0
     max_consecutive_failures: int = 3
+    max_disk_bytes: int = 0  # 0 = unlimited
 
     def __post_init__(self) -> None:
         if self.max_iterations < 0 or self.max_experiments < 0:
             raise ValueError("budgets must be >= 0")
         if self.max_wall_seconds <= 0 or self.max_experiment_seconds <= 0:
             raise ValueError("time budgets must be > 0")
+        if self.max_disk_bytes < 0:
+            raise ValueError("max_disk_bytes must be >= 0")
 
     def to_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)
@@ -148,6 +165,7 @@ class Budget:
             max_experiment_seconds=float(data.get("max_experiment_seconds", 600)),
             max_cost_usd=float(data.get("max_cost_usd", 0.0)),
             max_consecutive_failures=int(data.get("max_consecutive_failures", 3)),
+            max_disk_bytes=int(data.get("max_disk_bytes", 0)),
         )
 
 
@@ -216,6 +234,13 @@ class ResearchConfig:
     max_queries: int = 3
     max_results_per_query: int = 5
     timeout_seconds: float = 20.0
+    # Scientific search hardening: refetch every finding and confirm against
+    # the primary source (Parser success != verification).
+    verify_primary: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.verify_primary, bool):
+            raise ValueError("verify_primary must be a boolean")
 
     def to_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)
@@ -228,6 +253,7 @@ class ResearchConfig:
             max_queries=int(data.get("max_queries", 3)),
             max_results_per_query=int(data.get("max_results_per_query", 5)),
             timeout_seconds=float(data.get("timeout_seconds", 20)),
+            verify_primary=bool(data.get("verify_primary", True)),
         )
 
 
@@ -267,6 +293,13 @@ class EngineeringConfig:
     exploration_constant: float = 1.414
     params: list[EngineeringParam] = field(default_factory=list)
     protected_paths: list[str] = field(default_factory=list)
+    direction: str = (
+        "maximize"  # ENGINEERING: added — objective direction for best-candidate selection
+    )
+
+    def __post_init__(self) -> None:
+        if self.direction not in {"maximize", "minimize"}:
+            raise ValueError("direction must be 'maximize' or 'minimize'")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -276,6 +309,7 @@ class EngineeringConfig:
             "exploration_constant": self.exploration_constant,
             "params": [p.to_dict() for p in self.params],
             "protected_paths": list(self.protected_paths),
+            "direction": self.direction,
         }
 
     @classmethod
@@ -287,6 +321,7 @@ class EngineeringConfig:
             exploration_constant=float(data.get("exploration_constant", 1.414)),
             params=[EngineeringParam.from_dict(p) for p in data.get("params", [])],
             protected_paths=list(data.get("protected_paths", [])),
+            direction=str(data.get("direction", "maximize")),
         )
 
 
@@ -324,6 +359,7 @@ class Objective:
     research: ResearchConfig = field(default_factory=ResearchConfig)
     engineering: EngineeringConfig = field(default_factory=EngineeringConfig)
     experience: ExperienceConfig = field(default_factory=ExperienceConfig)
+    security: SecurityConfig = field(default_factory=SecurityConfig)
     state_dir: str = ".pro2"
     supervision_interval: int = 10
     seed: int = 0
@@ -365,6 +401,7 @@ class Objective:
             "research": self.research.to_dict(),
             "engineering": self.engineering.to_dict(),
             "experience": self.experience.to_dict(),
+            "security": self.security.to_dict(),
             "state_dir": self.state_dir,
             "supervision_interval": self.supervision_interval,
             "seed": self.seed,
@@ -401,6 +438,7 @@ class Objective:
             research=ResearchConfig.from_dict(data.get("research") or {}),
             engineering=EngineeringConfig.from_dict(data.get("engineering") or {}),
             experience=ExperienceConfig.from_dict(data.get("experience") or {}),
+            security=SecurityConfig.from_dict(data.get("security") or {}),
             state_dir=str(data.get("state_dir", ".pro2")),
             supervision_interval=int(data.get("supervision_interval", 10)),
             seed=int(data.get("seed", 0)),

@@ -33,18 +33,31 @@ from pro2.evidence import (
 from pro2.experience import ExperienceBank
 from pro2.experiment import *  # noqa: F403  (re-export convenience)
 from pro2.git_sandbox import GitError, GitSandbox, ProtectedPathError, Worktree
-from pro2.hypothesis import Hypothesis, select_hypothesis
+from pro2.hypothesis import Hypothesis, adaptive_reschedule, select_hypothesis
+from pro2.integrity import (
+    assert_snapshot_integrity,
+    evaluator_mismatch,
+    pin_evaluator,
+)
+from pro2.integrity import (
+    lineage as experiment_lineage,
+)
 from pro2.optimizer import EngineeringOptimizer, apply_config
 from pro2.problem import Problem
 from pro2.records import EngineeringTrial, Experiment
 from pro2.research import ResearchEngine, ResearchFinding
 from pro2.state import EngineState, StateStore
-from pro2.util import truncate, utc_now
+from pro2.util import sha256_text, truncate, utc_now
 from pro2.verification import MetricMeasurement, measure_metric, verify_commit
 
 
 class Engine:
     """Runs the complete Pro² loop against one objective."""
+
+    # Fail-closed escalation: repeated reviewer unavailability pauses the run
+    # for human triage instead of silently continuing or approving.
+    MAX_REVIEWER_UNAVAILABLE = 3
+    MAX_PI_MALFORMED = 3
 
     def __init__(
         self,
@@ -61,7 +74,9 @@ class Engine:
         self.sandbox = sandbox or GitSandbox(
             self.repo, self.store.worktrees_dir, self.store.verify_dir
         )
-        self.agent = agent or AgentRunner(objective.agent, self.store.artifacts_dir)
+        self.agent = agent or AgentRunner(
+            objective.agent, self.store.artifacts_dir, security=objective.security
+        )
         self.experience = (
             ExperienceBank(self.store.experience_file, objective.experience.max_entries)
             if objective.experience.enabled
@@ -108,6 +123,9 @@ class Engine:
                 "objective": self.objective.to_dict(),
                 "provider": self._provider_name(),
                 "baseline_measurement": baseline.to_dict(),
+                # Integrity: pin the evaluator contract so candidates cannot
+                # drift verify/tests mid-run.
+                "evaluator_digest": pin_evaluator(self.objective),
             },
         )
         self.store.append_event(
@@ -373,6 +391,9 @@ class Engine:
                     for item in payload["hypotheses"]:
                         if not isinstance(item, dict):
                             continue
+                        confidence = 0.5
+                        if isinstance(item.get("confidence"), (int, float)):
+                            confidence = _clamp(float(item["confidence"]))
                         hypothesis = Hypothesis(
                             problem_id=problem.problem_id,
                             candidate_id=str(item.get("candidate_id") or candidate.candidate_id),
@@ -384,7 +405,16 @@ class Engine:
                             title=str(item.get("title", "")),
                             target_delta=_optional_float(item.get("target_delta")),
                             instructions=str(item.get("instructions", candidate.instructions)),
+                            confidence=confidence,
                         )
+                        for edge in item.get("edges", []) or []:
+                            if isinstance(edge, dict):
+                                hypothesis.add_edge(
+                                    str(edge.get("parent_id", "")),
+                                    str(edge.get("relation", "supports")),
+                                )
+                        for parent_id in item.get("contradicts", []) or []:
+                            hypothesis.add_edge(str(parent_id), "contradicts")
                         if self._add_hypothesis_safely(hypothesis):
                             created += 1
                 elif candidate.instructions or candidate.patch:
@@ -446,12 +476,38 @@ class Engine:
         if not self.state.pending_hypotheses() and not self.objective.seed_problems:
             self._generate_hypotheses()
 
-    # ------------------------------------------------------------------- step
+    # -------------------------------------------------------------- integrity
+    def _assert_integrity(self) -> None:
+        """Fail closed when the verification evaluator drifted from the pin."""
+        pinned = self.state.metadata.get("evaluator_digest")
+        if not pinned:
+            return
+        error = evaluator_mismatch(self.objective, str(pinned))
+        if error:
+            self.store.append_event("integrity_violation", error=error)
+            raise RuntimeError(error)
+
+    def _assert_invariants(self) -> None:
+        """Paper §2: Problem State ↔ experiment ↔ Git snapshot invariants."""
+        if self.state.phase not in {"science", "engineering", "done"}:
+            raise RuntimeError(f"invariant violated: unexpected phase {self.state.phase!r}")
+        if self.state.best_commit is None:
+            raise RuntimeError("invariant violated: best_commit is None")
+        if not self.sandbox.commit_exists(self.state.best_commit):
+            raise RuntimeError(
+                f"invariant violated: best_commit {self.state.best_commit[:12]} "
+                "is not a git object in the repository"
+            )
+
+    # -------------------------------------------------------------- step
     def step(self) -> Experiment | None:
         with self.store.lock():
             return self._step_locked()
 
     def _step_locked(self) -> Experiment | None:
+        # Fail closed when the evaluator or invariants were violated.
+        self._assert_integrity()
+        self._assert_invariants()
         if self.state.status in {"initialized", "paused"}:
             self.state.status = "running"
         if self.store.pause_requested():
@@ -468,6 +524,9 @@ class Engine:
             self.store.append_event("budget_exhausted", reason=reason)
             return None
 
+        # Paper: adaptive rescheduling — boost under-attempted problems whose
+        # hypotheses keep being falsified, then re-score pending hypotheses.
+        adaptive_reschedule(self.state)
         hypothesis = select_hypothesis(
             self.state.pending_hypotheses(),
             self.state.candidate_beliefs(),
@@ -504,6 +563,9 @@ class Engine:
             base_commit=self.state.best_commit or self.sandbox.head(),
             baseline_metric=self.state.baseline_metric,
         )
+        # Reproducible lineage + git snapshot identity for the experiment.
+        experiment.lineage = experiment_lineage(experiment.base_commit, self.state.best_commit)
+        experiment.snapshot_digest = assert_snapshot_integrity(self.sandbox, experiment.base_commit)
         hypothesis.status = "running"
         hypothesis.attempts += 1
         hypothesis.experiment_id = experiment.experiment_id
@@ -536,7 +598,7 @@ class Engine:
             attempts = self.objective.agent.max_retries + 1
 
             for attempt in range(attempts):
-                fingerprint_before = self.sandbox.fingerprint()
+                fingerprint_before = self.sandbox.fingerprint(active=worktree.path)
                 patch = hypothesis.metadata.get("patch") or candidate.patch
                 if patch:
                     applied, error = self._apply_patch(worktree.path, patch)
@@ -567,7 +629,7 @@ class Engine:
                         experiment.reason = f"implementation agent failed: {result.error}"
                         break
 
-                fingerprint_after = self.sandbox.fingerprint()
+                fingerprint_after = self.sandbox.fingerprint(active=worktree.path)
                 if fingerprint_after != fingerprint_before:
                     experiment.reason = (
                         "agent modified files outside the experiment worktree; aborting"
@@ -592,10 +654,10 @@ class Engine:
                 review = self._review(hypothesis, stats, worktree.path)
                 experiment.review = review
                 if review.get("approved"):
+                    # Explicit approval record: reviewer identity + diff digest.
+                    self._record_approval(experiment)
                     break
-                feedback = truncate(
-                    "\n".join(review.get("reasons", [])) or "review rejected", 1200
-                )
+                feedback = truncate("\n".join(review.get("reasons", [])) or "review rejected", 1200)
                 hypothesis.review_feedback = feedback
                 if attempt + 1 >= attempts:
                     experiment.reason = "reviewer rejected: " + feedback
@@ -621,6 +683,7 @@ class Engine:
                 )
                 return experiment
 
+            self._assert_integrity()
             verification = verify_commit(
                 self.sandbox,
                 self.objective,
@@ -647,6 +710,8 @@ class Engine:
             if verification.accepted:
                 candidate.adjust_belief(self.objective.belief_positive_delta)
                 hypothesis.status = "accepted"
+                hypothesis.adjust_confidence(0.15)
+                candidate.evidence.append(experiment.experiment_id)
                 self.state.best_commit = commit
                 self.state.best_metric = verification.candidate_metric
                 self.sandbox.set_best(commit)
@@ -656,7 +721,16 @@ class Engine:
                 experiment.status = "accepted"
             else:
                 candidate.adjust_belief(-self.objective.belief_negative_delta)
-                hypothesis.status = "rejected"
+                # Falsification (paper: hypothesis executed and the metric did
+                # not improve) is distinct from an unverified rejection: only a
+                # measured outcome can falsify.
+                falsified = verification.candidate_metric is not None
+                hypothesis.status = "falsified" if falsified else "rejected"
+                if falsified:
+                    hypothesis.falsified = True
+                    hypothesis.falsification_reason = verification.reason
+                hypothesis.adjust_confidence(-0.25 if falsified else -0.15)
+                candidate.evidence.append(experiment.experiment_id)
                 self.state.consecutive_failures += 1
                 self._record_experience(experiment, hypothesis, problem, candidate, accepted=False)
                 experiment.status = "rejected"
@@ -769,6 +843,13 @@ class Engine:
         heuristic = self._heuristic_review(hypothesis, stats, worktree)
         if not heuristic["approved"]:
             return heuristic
+
+        reviewer_meta = {
+            "reviewer_id": "",
+            "reviewer_source": "heuristic",
+            "review_digest": sha256_text(stats.patch),
+        }
+
         diff_summary = (
             f"{len(stats.changed_paths)} files, +{stats.added}/-{stats.removed}\n"
             + "\n".join(stats.changed_paths)
@@ -781,16 +862,32 @@ class Engine:
                 timeout_seconds=self._review_timeout(),
             )
         except AgentError:
-            return heuristic
+            # Fail closed: an unavailable reviewer must never silently approve.
+            self.state.reviewer_unavailable += 1
+            self._escalate("reviewer unavailable")
+            return {
+                "approved": False,
+                "single_variable": False,
+                "reasons": ["reviewer unavailable; failing closed"],
+                "violations": [],
+                "source": "agent",
+                "reviewer": reviewer_meta,
+            }
         if result.cost_usd:
             self._add_cost(result.cost_usd)
+        reviewer_meta["reviewer_id"] = result.session_id or result.model or "unknown"
+        reviewer_meta["reviewer_source"] = result.provider or "agent"
+
         if not isinstance(payload, dict):
+            self.state.reviewer_unavailable += 1
+            self._escalate("reviewer returned malformed output")
             return {
                 "approved": False,
                 "single_variable": False,
                 "reasons": ["reviewer returned a missing or malformed review"],
                 "violations": [],
                 "source": "agent",
+                "reviewer": reviewer_meta,
             }
         agent_violations = [str(x) for x in payload.get("violations", []) if str(x).strip()]
         if payload.get("approved") is not True or agent_violations:
@@ -800,6 +897,7 @@ class Engine:
                 "reasons": agent_violations or ["reviewer did not approve the change"],
                 "violations": agent_violations,
                 "source": "agent",
+                "reviewer": reviewer_meta,
             }
         if payload.get("single_variable") is not True:
             return {
@@ -808,6 +906,7 @@ class Engine:
                 "reasons": ["reviewer flagged multiple variables in the diff"],
                 "violations": [],
                 "source": "agent",
+                "reviewer": reviewer_meta,
             }
         return {
             "approved": True,
@@ -816,7 +915,37 @@ class Engine:
             or ["agent approved"],
             "violations": [],
             "source": "agent",
+            "reviewer": reviewer_meta,
         }
+
+    def _escalate(self, reason: str) -> None:
+        """Record a fail-closed escalation and journal it to the event log."""
+        entry = {"reason": reason, "timestamp": utc_now()}
+        self.state.escalations.append(entry)
+        self.store.append_event("escalation", **entry)
+        self.store.save_state(self.state)
+
+    def _record_approval(self, experiment: Experiment) -> None:
+        """Explicit approval record: reviewer identity + diff digest on the experiment."""
+        review = experiment.review or {}
+        reviewer = review.get("reviewer") or {}
+        experiment.reviewer_id = str(reviewer.get("reviewer_id", ""))
+        experiment.reviewer_source = str(reviewer.get("reviewer_source", ""))
+        experiment.review_digest = str(reviewer.get("review_digest", ""))
+        record = {
+            "experiment_id": experiment.experiment_id,
+            "hypothesis_id": experiment.hypothesis_id,
+            "reviewer_id": experiment.reviewer_id,
+            "reviewer_source": experiment.reviewer_source,
+            "diff_sha256": experiment.review_digest,
+        }
+        self.state.metadata["last_approval"] = record
+        self.store.append_event("approval_recorded", **record)
+        self.store.save_state(self.state)
+
+    def approval_records(self) -> list[dict[str, Any]]:
+        """Ledger of explicit reviewer approval records (audit trail)."""
+        return [e for e in self.store.events() if e.get("type") == "approval_recorded"]
 
     def _review_timeout(self) -> float:
         return min(
@@ -854,7 +983,9 @@ class Engine:
         if not self.experience:
             return ""
         entries = self.experience.search(
-            f"{problem.description} {query}", limit=self.objective.experience.retrieval_limit
+            f"{problem.description} {query}",
+            limit=self.objective.experience.retrieval_limit,
+            certified_only=True,
         )
         return self.experience.format_for_prompt(entries)
 
@@ -882,6 +1013,10 @@ class Engine:
             outcome="accepted" if accepted else "rejected",
             tags=[self.objective.name, problem.problem_id, candidate.candidate_id],
             evidence=[experiment.experiment_id],
+            # Certification: only independently verified outcomes are
+            # authoritative; unverified lessons carry low confidence.
+            certified=accepted,
+            confidence=1.0 if accepted else 0.2,
         )
 
     # ------------------------------------------------------------------- run
@@ -912,6 +1047,11 @@ class Engine:
             if reason:
                 status = "budget_exhausted"
                 self.state.stop_reason = reason
+                break
+            escalation = self._escalation_threshold_reached()
+            if escalation:
+                status = "paused"
+                self.state.stop_reason = escalation
                 break
             experiment = self.step()
             if experiment is None:
@@ -975,6 +1115,11 @@ class Engine:
                 f"consecutive failure limit reached "
                 f"({self.objective.budget.max_consecutive_failures})"
             )
+        disk_limit = self.objective.budget.max_disk_bytes
+        if disk_limit > 0:
+            disk_used = self.store.disk_usage_bytes()
+            if disk_used > disk_limit:
+                return f"disk budget exhausted ({disk_used} > {disk_limit} bytes)"
         return ""
 
     def supervise(self) -> bool:
@@ -988,6 +1133,10 @@ class Engine:
         except AgentError:
             return True
         if not isinstance(payload, dict):
+            # Ambiguous PI output: record it, escalate, keep running but
+            # bounded — repeated ambiguity pauses the run for human triage.
+            self.state.pi_malformed += 1
+            self._escalate("PI supervisor returned malformed output")
             return True
         if payload.get("new_problems"):
             self._parse_problems({"problems": payload["new_problems"]})
@@ -997,6 +1146,15 @@ class Engine:
         if payload.get("notes"):
             self.state.insights.append(str(payload["notes"]))
         return True
+
+    def _escalation_threshold_reached(self) -> str | None:
+        if self.state.reviewer_unavailable >= self.MAX_REVIEWER_UNAVAILABLE:
+            return (
+                f"reviewer unavailable {self.state.reviewer_unavailable} times; escalate to human"
+            )
+        if self.state.pi_malformed >= self.MAX_PI_MALFORMED:
+            return f"PI supervisor ambiguous {self.state.pi_malformed} times; escalate to human"
+        return None
 
     # ------------------------------------------------------------ engineering
     def run_engineering(self) -> None:
@@ -1021,9 +1179,12 @@ class Engine:
                 gamma=config.gamma,
                 seed=self.objective.seed,
                 exploration_constant=config.exploration_constant,
+                direction=config.direction,
             )
         )
         self.store.append_event("engineering_started", root_commit=root_commit)
+        self._assert_integrity()
+        self._assert_invariants()
 
         while True:
             reason = self._budget_reason()
@@ -1080,6 +1241,7 @@ class Engine:
                     trial.reason = str(exc)
                     continue
 
+                self._assert_integrity()
                 verification = verify_commit(
                     self.sandbox,
                     self.objective,
@@ -1163,9 +1325,7 @@ class Engine:
             return
         if merged:
             self.state.metadata["engineering_merged_commit"] = merged
-            self.store.append_event(
-                "engineering_merged_best", commit=merged, metric=best.metric
-            )
+            self.store.append_event("engineering_merged_best", commit=merged, metric=best.metric)
 
     # --------------------------------------------------------------- recovery
     def recover(self) -> EngineState:
@@ -1218,7 +1378,9 @@ class Engine:
     def _measure_commit(self, spec: Any, commit: str, label: str) -> MetricMeasurement:
         path = self.sandbox.create_verification_worktree(commit, label)
         try:
-            return measure_metric(spec, path, self.store.artifacts_dir, label)
+            return measure_metric(
+                spec, path, self.store.artifacts_dir, label, isolation=self.objective.security
+            )
         finally:
             self.sandbox.remove_verification_worktree(path)
 

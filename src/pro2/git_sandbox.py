@@ -8,6 +8,7 @@ import subprocess
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from pro2.util import safe_id, sha256_text, truncate
 
@@ -67,6 +68,16 @@ class GitSandbox:
 
     def head(self) -> str:
         return self._git("rev-parse", "HEAD").strip()
+
+    def commit_exists(self, commit: str) -> bool:
+        """True when `commit` resolves to a real git object."""
+        if not commit:
+            return False
+        return bool(
+            self._git(
+                "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}", check=False
+            ).strip()
+        )
 
     def is_clean(self) -> bool:
         return not self._git("status", "--porcelain").strip()
@@ -231,24 +242,32 @@ class GitSandbox:
             return result.stdout.strip()
         return self.head()
 
-    def fingerprint(self) -> dict[str, str]:
+    def fingerprint(self, active: Path | None = None) -> dict[str, Any]:
+        """Repo + other-worktree status digest; used to detect out-of-sandbox edits.
+
+        The active worktree is excluded from the digest so in-sandbox agent
+        changes are not false positives.
+        """
+        active_path = active.resolve() if active is not None else None
         status = self._git("status", "--porcelain")
-        return {
+        data: dict[str, Any] = {
             "head": self.head(),
             "status_hash": sha256_text(status),
             "status": truncate(status, 4000),
+            "other_worktrees": {},
         }
+        for path in self.list_worktrees():
+            if active_path is not None and path == active_path:
+                continue
+            other_status = self._git("status", "--porcelain", cwd=path)
+            data["other_worktrees"][str(path)] = sha256_text(other_status)
+        return data
 
     def cleanup_orphans(self, active_paths: set[str] | None = None) -> list[str]:
         """Remove only engine-owned worktrees/branches that are not active."""
         active = {str(Path(p).resolve()) for p in (active_paths or set())}
         removed: list[str] = []
-        output = self._git("worktree", "list", "--porcelain")
-        for block in output.split("\n\n"):
-            path_line = next((ln for ln in block.splitlines() if ln.startswith("path ")), "")
-            if not path_line:
-                continue
-            path = Path(path_line[5:].strip()).resolve()
+        for path in self._porcelain_worktree_paths():
             if path in active:
                 continue
             if path.is_relative_to(self.worktree_root) or path.is_relative_to(self.verify_root):
@@ -265,12 +284,15 @@ class GitSandbox:
         return removed
 
     def list_worktrees(self) -> list[Path]:
+        return [p for p in self._porcelain_worktree_paths() if p != self.repo]
+
+    def _porcelain_worktree_paths(self) -> list[Path]:
         output = self._git("worktree", "list", "--porcelain")
-        return [
-            Path(line[5:].strip())
-            for line in output.splitlines()
-            if line.startswith("path ") and Path(line[5:].strip()) != self.repo
-        ]
+        paths: list[Path] = []
+        for line in output.splitlines():
+            if line.startswith("worktree "):
+                paths.append(Path(line[len("worktree ") :].strip()).resolve())
+        return paths
 
 
 def _matches(path: str, pattern: str) -> bool:

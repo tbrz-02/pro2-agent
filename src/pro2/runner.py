@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from pro2.security import SecurityConfig, enforce_isolation, scrub_environment
 from pro2.util import truncate
 
 
@@ -110,6 +111,16 @@ def _group_rss_bytes(pgid: int) -> int:
 
 
 def _kill_group(pid: int) -> None:
+    # Graceful-then-forced: TERM the whole group, SIGKILL it if it survives.
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        os.killpg(os.getpgid(pid), 0)
+    except (ProcessLookupError, PermissionError, OSError):
+        return
+    time.sleep(0.5)
     try:
         os.killpg(os.getpgid(pid), signal.SIGKILL)
     except (ProcessLookupError, PermissionError, OSError):
@@ -143,8 +154,14 @@ def run_command(
     stall_seconds: float = 0.0,
     divergence_regex: str | None = None,
     stdin_text: str | None = None,
+    isolation: SecurityConfig | None = None,
 ) -> RunResult:
-    """Execute a command in its own process group and enforce resource guards."""
+    """Execute a command in its own process group and enforce resource guards.
+
+    When isolation is enabled, the command is wrapped in the selected backend
+    and the environment is scrubbed of secret-looking variables. Raises
+    IsolationError if isolation is requested but no backend is available.
+    """
     cwd_path = Path(cwd)
     command_text = command if isinstance(command, str) else " ".join(command)
     artifact_root = Path(artifacts_dir) if artifacts_dir else Path.cwd() / ".pro2" / "artifacts"
@@ -163,7 +180,11 @@ def run_command(
             error=f"working directory does not exist: {cwd_path}",
         )
 
-    merged_env = os.environ.copy()
+    if isolation is not None and isolation.enabled:
+        command, _scrub_env = enforce_isolation(isolation, command, cwd_path)
+        merged_env = scrub_environment(os.environ)
+    else:
+        merged_env = os.environ.copy()
     merged_env.setdefault("PYTHONUNBUFFERED", "1")
     if env:
         merged_env.update({str(k): str(v) for k, v in env.items()})

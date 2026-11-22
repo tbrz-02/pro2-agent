@@ -74,6 +74,36 @@ Where:
   no access to the implementer's sandbox; `verification.verify_commit`).
 - Post-experiment telemetry and performance measurement — PAPER
   (`experiment.verification`, `experiment.delta`).
+- Isolation boundary — ENGINEERING (`security.enforce_isolation` wraps agent
+  commands; see §11). Fail-closed: when isolation is enabled and no backend
+  is available, execution is refused (`IsolationError`) rather than run
+  unprotected.
+- Evaluator pinning — ENGINEERING (`integrity.pin_evaluator` digests the
+  verify spec + tests at `initialize`; `Engine._assert_integrity` refuses to
+  continue before every verification if the evaluator changed mid-run).
+- Out-of-sandbox detection — ENGINEERING (`git_sandbox.fingerprint(active=)`;
+  compares the main checkout and other worktrees before/after each agent run;
+  changes outside the experiment worktree abort it).
+- Reproducible lineage — ENGINEERING (`Experiment.lineage`,
+  `Experiment.snapshot_digest`; `integrity.assert_snapshot_integrity`).
+
+### Search extensions (ENGINEERING)
+
+- Hypothesis graph — DERIVED (`Hypothesis.edges`: supports/contradicts/
+  derived_from; `Hypothesis.contradicts()`).
+- Confidence — DERIVED (`Hypothesis.confidence`, `Hypothesis.adjust_confidence`):
+  belief-adjacent signal used by adaptive rescheduling; the paper's
+  selection formula stays PAPER (`hypothesis_priority`).
+- Falsification — DERIVED (`Hypothesis.status = "falsified"`,
+  `Hypothesis.falsified/falsification_reason`): a hypothesis that executed
+  and produced a measured, non-improving outcome is falsified (distinct from
+  an unverified rejection).
+- Adaptive rescheduling — DERIVED (`hypothesis.adaptive_reschedule`:
+  under-attempted problems with ≥2 falsified hypotheses get their attempts
+  boosted; re-scored against the paper's `Pri = b/(N+1)` formula each step).
+- Evidence-backed belief updates — DERIVED (`CandidateSolution.evidence`:
+  experiment IDs appended on acceptance/rejection; belief still moves only
+  through the paper's Δb_pos/Δb_neg in `adjust_belief`).
 
 Retry loop: PAPER — "Reviewer checks single-variable isolation; revise until
 approved or fall back". ENGINEERING — the engine re-submits the same
@@ -121,6 +151,10 @@ Engineering optimization uses MCTS over engineering configurations.
 
 The scientific root architecture must remain invariant.
 
+Best-candidate selection — ENGINEERING (`EngineeringOptimizer.best()`):
+the highest-validation node wins when `EngineeringConfig.direction =
+"maximize"`; the lowest wins for `"minimize"` (paper Eq. 3/4 semantics).
+
 Allowed optimization dimensions include:
 
 - Learning-rate schedules — PAPER
@@ -149,7 +183,9 @@ UCT is used to balance exploration and exploitation — PAPER
 (`optimizer.uct`: mean reward + exploration constant × sqrt(ln(parent)/n)).
 ENGINEERING — unvisited nodes are explored first; `record_result` credits
 failed trials no reward and backpropagates nothing (paper: failed branches
-are physically purged).
+are physically purged). Mathematical regression tests: `tests/test_optimizer.py`
+(maximize/minimize `best()`, failed-node no-reward, ancestor backpropagation,
+selection order, reward formula).
 
 Cost-aware reward:
 
@@ -194,6 +230,47 @@ final reference model (`git_sandbox.merge_into_primary`; event
 - Approves or rejects changes
 - Provides targeted remediation feedback
 
+Reviewer governance extensions — ENGINEERING (`Engine._review`, `Engine._escalate`):
+
+- **Fail-closed**: missing, malformed, non-`True`-approved or ambiguous reviews
+  reject; hard constraints reject even when they appear to approve.
+  Reviewer unavailability is recorded (`EngineState.reviewer_unavailable`) and
+  escalated (`Engine.MAX_REVIEWER_UNAVAILABLE = 3`).
+- **Approval records**: approved experiments carry
+  `Experiment.reviewer_id/reviewer_source/review_digest`; explicit
+  `approval_recorded` events are journaled; `Engine.approval_records()` is the
+  audit ledger; `state.metadata["last_approval"]` holds the latest one.
+- **Bounded retry**: implementation agents get `agent.max_retries + 1`
+  attempts with reviewer feedback; after that the experiment is rejected and
+  the hypothesis's belief/confidence are lowered.
+- **PI supervision**: `supervise()` malformed/ambiguous output is recorded
+  (`EngineState.pi_malformed`) and escalated (`Engine.MAX_PI_MALFORMED = 3`);
+  PI "stop" pauses the run with an explicit reason.
+
+### Security Hardening (ENGINEERING, not in the paper)
+
+`src/pro2/security.py` + `src/pro2/integrity.py`:
+
+- **Isolation**: agents, verification tests and diagnostics run inside the
+  detected backend (`unshare -rm`, `docker`, `bwrap`, `nsjail`).
+  `enforce_isolation` is **fail-closed**: when isolation is enabled and no
+  backend is available, execution raises `IsolationError` instead of running
+  unprotected. Wired via `runner.run_command(..., isolation=...)` in
+  `agents.py`, `verification.py` and `evidence.py`.
+- **Environment scrubbing**: `scrub_environment` drops `SECRET|TOKEN|KEY|
+  AUTH|SESSION|COOKIE|...` variables from the agent environment.
+- **Credential protection**: `credential_paths` identifies `~/.ssh`,
+  `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.netrc`, `~/.docker`, `~/.gcloud`,
+  `~/.azure`.
+- **Evaluator pinning**: `integrity.pin_evaluator` digests the verify spec +
+  tests at `initialize`; `Engine._assert_integrity` refuses to continue before
+  every verification if the evaluator changed mid-run.
+- **Snapshot integrity**: `integrity.assert_snapshot_integrity`; every
+  `Experiment` records `snapshot_digest` + `lineage` (base commit → best).
+- **Out-of-sandbox detection**: `git_sandbox.fingerprint(active=...)`;
+  main-checkout and other-worktree status digests compared before/after each
+  agent run; changes outside the experiment worktree abort it.
+
 ## 6. Runtime Resource Governance
 
 Monitor:
@@ -204,11 +281,20 @@ Monitor:
 
 Required protections:
 
-- Detect NaN/Inf divergence
-- Stop stalled I/O
-- Enforce preprocessing caps
-- Support controlled soft-margin extensions
-- Prevent runaway execution
+- Detect NaN/Inf divergence (`MetricSpec.divergence_regex`)
+- Stop stalled I/O (`stall_seconds`; `divergence_regex` kills on pattern)
+- Enforce preprocessing caps (`MetricSpec.memory_limit_mb` →
+  `run_command(memory_limit_mb=...)`; `RLIMIT_AS` + `/proc` RSS polling)
+- Support controlled soft-margin extensions (`MetricSpec`/`Constraint` knobs)
+- Prevent runaway execution (timeouts, process-group termination with
+  `SIGTERM` → `SIGKILL` escalation in `runner._kill_group`,
+  `Budget.max_disk_bytes` + `StateStore.disk_usage_bytes()`)
+- **Disk governance (ENGINEERING)**: `Budget.max_disk_bytes` +
+  `StateStore.disk_usage_bytes()`; the run pauses with `disk budget
+  exhausted` at the boundary.
+- **Network governance (ENGINEERING)**: `security.network = "deny"` — the
+  selected isolation backend removes egress; unisolated runs rely on the
+  reviewer + evaluator-pin + fingerprint controls (see §11).
 
 ## 7. Experience Bank
 
@@ -222,6 +308,11 @@ Expected capabilities:
 - Reusable fixes
 - Cross-iteration retrieval
 - Preemptive experience retrieval
+- **Certified lessons (ENGINEERING)**: `ExperienceEntry.certified` +
+  `confidence` (0..1); only engine-verified outcomes are certified
+  (`_record_experience`); `ExperienceBank.search(..., certified_only=True)`
+  is used by `Engine._experience_for` so unverified lessons never become
+  authoritative; confidence is a small positive search bonus.
 
 ## 8. Git-Backed Experiment Isolation
 
@@ -237,19 +328,46 @@ Requirements:
 
 ## 9. Implementation Status
 
-Not implemented yet.
+Implemented (paper mechanisms + engineering hardening, all covered by tests
+under `tests/`):
 
-The following must be formally resolved before coding:
+- Problem State schema, belief init/Δb, hypothesis lifecycle, priority,
+  UCT selection (`hypothesis.py`, `problem_state.py`, `state.py`).
+- Believed-based search; adaptive rescheduling + confidence + falsification
+  (`adaptive_reschedule`, `EngineState` search extensions).
+- Resource governance: timeouts, memory caps, stall/divergence detection,
+  process-group `SIGTERM`→`SIGKILL`, disk budgets (`Budget.max_disk_bytes`).
+- Reviewer fail-closed, approval records, bounded retry, escalation; PI
+  supervision (`Engine._review`, `Engine._escalate`, `EngineState.escalations`).
+- Experimental integrity: evaluator pinning, snapshot digest, lineage,
+  out-of-sandbox fingerprint, invariants (`integrity.py`, `git_sandbox.py`,
+  `orchestrator.py`).
+- Security: isolation backends, fail-closed policy, env scrubbing, credential
+  paths, network denial (`security.py`, `runner.py`, `agents.py`,
+  `verification.py`, `evidence.py`).
+- Experience Bank: certification + confidence + certified retrieval.
+- Research: provenance (`fetch_url`/`fetch_digest`), primary-source
+  verification (`ResearchEngine._verify_finding`), `verify_primary` config.
+- Recovery: corrupt-state fallback to backup, interrupted experiment/trial
+  marking, orphan cleanup (`state.py`, `git_sandbox.py`, `Engine.recover`).
+- Engineering MCTS: `direction` maximize/minimize semantics; math regression
+  tests in `tests/test_optimizer.py` and `tests/test_optimizer_fidelity.py`.
+- End-to-end + adversarial tests: `tests/test_e2e_cli.py`,
+  `tests/test_recovery.py`, `tests/test_security.py`,
+  `tests/test_integrity.py`, `tests/test_scientific_search.py`,
+  `tests/test_review_governance.py`, `tests/test_resource_governance.py`.
 
-- Exact Problem State schema
-- Belief initialization
-- Belief increments Δb_pos and Δb_neg
-- δ_target definition
-- Hypothesis lifecycle and queue representation
-- Exact UCT selection equation
-- Resource budget allocation rules
-- Experience Bank schema
-- Reviewer audit interface
+Resolved before coding: Problem State schema, belief deltas, δ_target,
+hypothesis lifecycle, UCT equation (§2–§4 PAPER entries).
+
+Remaining gaps / limitations (documented honestly in `docs/threat-model.md`):
+
+- Isolation requires a working backend (`unshare` user namespaces or
+  Docker); without one, execution fails closed.
+- The `http` provider cannot be isolated (no process boundary exists).
+- Divergence detection is a sampled-output heuristic, not a proof.
+- Engineering `direction="minimize"` semantics are DERIVED from the paper's
+  symmetric Eq. 3/4 (paper text specifies maximize only).
 
 ## 10. Fidelity Rule
 
@@ -263,3 +381,22 @@ Engineering adaptations must be explicitly marked:
 - UNVERIFIED: requires further source inspection
 
 This document is a working specification, not proof of complete reproduction.
+
+## 11. Threat Model
+
+Summary of the threat surface and its controls:
+
+| # | Threat | Control |
+| --- | --- | --- |
+| T1 | Candidate tampering (diff, tests, metric, patch) | isolation, reviewer hard constraints, evaluator pin, blind verification, fingerprint, lineage |
+| T2 | Credential exfiltration / secret abuse | env scrubbing, credential path identification, isolation |
+| T3 | Network abuse | `security.network = "deny"` isolation; research primary-source verification |
+| T4 | DoS / resource abuse | timeouts, `SIGTERM`→`SIGKILL`, memory rlimits, stall + divergence detection, disk budget, cost budget |
+| T5 | State tampering / journal integrity | atomic writes, `state.json.bak` fallback, exclusive lock, append-only event journal, invariants |
+| T6 | Reviewer / PI governance downgrade | fail-closed reviewer, approval records, bounded retry, escalation (`MAX_REVIEWER_UNAVAILABLE`, `MAX_PI_MALFORMED`) |
+| T7 | Isolation unavailability | fail-closed `IsolationError`; `pro2 doctor` reports backends |
+| T8 | Experience Bank poisoning | certification + confidence, certified-only retrieval |
+| T9 | Misleading science outputs | primary-source verification of findings, normalized signatures |
+
+Full detail: `docs/threat-model.md` (threats, controls, trust boundaries,
+documented limits).

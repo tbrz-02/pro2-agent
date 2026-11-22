@@ -113,6 +113,7 @@ def run_diagnostics(
             artifacts_dir=artifacts_dir,
             label=f"diagnostic-{index + 1}",
             env=spec.env,
+            isolation=objective.security,
         )
         runs.append(run)
         output = (run.stdout + "\n" + run.stderr).strip()

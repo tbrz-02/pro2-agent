@@ -14,7 +14,14 @@ from typing import Any
 from pro2.hypothesis import Hypothesis
 from pro2.problem_state import ProblemState
 from pro2.records import Experiment
-from pro2.util import append_jsonl, atomic_write_text, read_json, utc_now, write_json
+from pro2.util import (
+    append_jsonl,
+    atomic_write_text,
+    read_json,
+    read_jsonl,
+    utc_now,
+    write_json,
+)
 
 
 class StateLockedError(RuntimeError):
@@ -44,6 +51,11 @@ class EngineState(ProblemState):
     consecutive_failures: int = 0
     in_flight: dict[str, Any] | None = None
     insights: list[str] = field(default_factory=list)
+    # Review/PI governance records (review_governance.py): escalations and
+    # reviewer availability counts — fail-closed state for ambiguous decisions.
+    escalations: list[dict[str, Any]] = field(default_factory=list)
+    reviewer_unavailable: int = 0
+    pi_malformed: int = 0
     stop_reason: str = ""
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
@@ -88,6 +100,9 @@ class EngineState(ProblemState):
                 "consecutive_failures": self.consecutive_failures,
                 "in_flight": self.in_flight,
                 "insights": list(self.insights),
+                "escalations": [dict(e) for e in self.escalations],
+                "reviewer_unavailable": self.reviewer_unavailable,
+                "pi_malformed": self.pi_malformed,
                 "stop_reason": self.stop_reason,
                 "created_at": self.created_at,
                 "updated_at": self.updated_at,
@@ -124,6 +139,9 @@ class EngineState(ProblemState):
             consecutive_failures=int(data.get("consecutive_failures", 0)),
             in_flight=data.get("in_flight"),
             insights=list(data.get("insights", [])),
+            escalations=[dict(e) for e in data.get("escalations", [])],
+            reviewer_unavailable=int(data.get("reviewer_unavailable", 0)),
+            pi_malformed=int(data.get("pi_malformed", 0)),
             stop_reason=str(data.get("stop_reason", "")),
             created_at=str(data.get("created_at", utc_now())),
             updated_at=str(data.get("updated_at", utc_now())),
@@ -167,6 +185,10 @@ class StateStore:
         if self.state_file.exists():
             shutil.copy2(self.state_file, self.backup_file)
         write_json(self.state_file, payload)
+        # Always keep a backup copy: if state.json is corrupted, the engine
+        # can fall back to the most recent known-good state.
+        if not self.backup_file.exists():
+            write_json(self.backup_file, payload)
 
     def load_state(self) -> EngineState:
         for path in (self.state_file, self.backup_file):
@@ -179,6 +201,10 @@ class StateStore:
             if isinstance(data, dict):
                 return EngineState.from_dict(data)
         raise FileNotFoundError(f"No readable engine state in {self.root}")
+
+    def events(self) -> list[dict[str, Any]]:
+        """All journaled events, oldest first (audit trail)."""
+        return read_jsonl(self.events_file)
 
     def append_event(self, event_type: str, **fields: Any) -> None:
         self.ensure()
@@ -228,6 +254,26 @@ class StateStore:
 
     def pause_requested(self) -> bool:
         return self.pause_file.exists()
+
+    def disk_usage_bytes(self) -> int:
+        """Total size of engine-owned state (worktrees, verify, artifacts, research)."""
+        total = 0
+        for directory in (
+            self.root,
+            self.worktrees_dir,
+            self.verify_dir,
+            self.artifacts_dir,
+            self.research_dir,
+        ):
+            if not directory.is_dir():
+                continue
+            for path in directory.rglob("*"):
+                try:
+                    if path.is_file():
+                        total += path.stat().st_size
+                except OSError:
+                    continue
+        return total
 
 
 __all__ = ["EngineState", "StateStore", "StateLockedError"]

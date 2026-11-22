@@ -60,6 +60,50 @@ def test_optimizer_best_is_highest_metric():
     assert opt.best().node_id == b
 
 
+def test_optimizer_best_respects_minimize_direction():
+    params = [EngineeringParam(path="config.json", key="work", values=[2.0, 3.0])]
+    opt = EngineeringOptimizer(params, max_nodes=5, gamma=0.0, seed=1, direction="minimize")
+    a, _ = opt.next_config()
+    opt.record_result(a, delta=1.0, duration_seconds=1.0, metric=2.0, commit="a")
+    b, _ = opt.next_config()
+    opt.record_result(b, delta=2.0, duration_seconds=1.0, metric=1.5, commit="b")
+
+    assert opt.best().node_id == b
+
+
+def test_optimizer_failed_nodes_get_no_reward_and_no_backprop():
+    params = [EngineeringParam(path="config.json", key="work", values=[2.0, 3.0])]
+    opt = EngineeringOptimizer(params, max_nodes=4, gamma=0.0, seed=1)
+    a, _ = opt.next_config()
+    value = opt.record_result(a, delta=1.0, duration_seconds=1.0, metric=None, status="failed")
+
+    assert value == 0.0
+    assert opt.nodes[a].visits == 1
+    assert opt.nodes[a].reward_sum == 0.0
+    root = opt.nodes[opt.root_id]
+    assert root.visits == 0
+
+
+def test_optimizer_reward_propagates_to_ancestors():
+    params = [EngineeringParam(path="config.json", key="work", values=[2.0, 3.0, 4.0])]
+    opt = EngineeringOptimizer(params, max_nodes=8, gamma=0.0, seed=1)
+    opt.next_config()
+    second, _ = opt.next_config()
+    value = opt.record_result(second, delta=2.0, duration_seconds=1.0, metric=4.0, commit="b")
+
+    root = opt.nodes[opt.root_id]
+    assert opt.nodes[second].reward_sum == pytest.approx(value)
+    assert root.reward_sum == pytest.approx(value)
+    assert root.visits == 1
+
+
+def test_optimizer_rejects_bad_direction():
+    with pytest.raises(ValueError):
+        EngineeringOptimizer(
+            [EngineeringParam(path="p", key="k", values=[1])], direction="sideways"
+        )
+
+
 def test_optimizer_stops_after_max_nodes():
     params = [EngineeringParam(path="config.json", key="work", values=[2.0, 3.0, 4.0])]
     opt = EngineeringOptimizer(params, max_nodes=2, gamma=0.0, seed=1)

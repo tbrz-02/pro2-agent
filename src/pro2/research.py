@@ -15,7 +15,7 @@ from typing import Any
 
 from pro2.config import ResearchConfig
 from pro2.problem import Problem
-from pro2.util import read_json, truncate, utc_now, write_json
+from pro2.util import read_json, sha256_text, truncate, utc_now, write_json
 
 __all__ = [
     "ResearchConfig",
@@ -37,6 +37,10 @@ class ResearchFinding:
     query: str
     fetched_at: str = field(default_factory=utc_now)
     verified: bool = False
+    # Provenance (scientific search hardening): the URL that was fetched and
+    # the digest of the page body, so findings can be re-verified independently.
+    fetch_url: str = ""
+    fetch_digest: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)
@@ -45,6 +49,15 @@ class ResearchFinding:
     def from_dict(cls, data: dict[str, Any]) -> ResearchFinding:
         known = set(cls.__dataclass_fields__)
         return cls(**{k: v for k, v in data.items() if k in known})
+
+
+def _normalize_title(title: str) -> str:
+    return re.sub(r"\s+", " ", title).strip().lower()
+
+
+def _fetch_with_digest(url: str, timeout: float) -> tuple[str, str]:
+    text = _http_get(url, timeout)
+    return text, sha256_text(text)
 
 
 def _http_get(url: str, timeout: float) -> str:
@@ -165,6 +178,11 @@ class ResearchEngine:
                 batch = [ResearchFinding.from_dict(x) for x in cached.get("findings", [])]
             else:
                 batch = self._query_providers(query)
+                if self.config.verify_primary:
+                    for finding in batch:
+                        result = self._verify_finding(finding)
+                        if result is False:
+                            finding.verified = False
                 self._cache[self._cache_key(query)] = {
                     "timestamp": utc_now(),
                     "findings": [f.to_dict() for f in batch],
@@ -200,23 +218,65 @@ class ResearchEngine:
                         "https://api.github.com/search/repositories"
                         f"?q={encoded}&sort=stars&order=desc&per_page={limit}"
                     )
-                    findings.extend(
-                        parse_github(_http_get(url, self.config.timeout_seconds), query)
-                    )
+                    text, digest = _fetch_with_digest(url, self.config.timeout_seconds)
+                    batch = parse_github(text, query)
+                    for finding in batch:
+                        finding.fetch_url = url
+                        finding.fetch_digest = digest
+                    findings.extend(batch)
                 elif provider == "arxiv":
                     url = (
                         "http://export.arxiv.org/api/query"
                         f"?search_query=all:{encoded}&start=0&max_results={limit}"
                     )
-                    findings.extend(parse_arxiv(_http_get(url, self.config.timeout_seconds), query))
+                    text, digest = _fetch_with_digest(url, self.config.timeout_seconds)
+                    batch = parse_arxiv(text, query)
+                    for finding in batch:
+                        finding.fetch_url = url
+                        finding.fetch_digest = digest
+                    findings.extend(batch)
                 elif provider == "duckduckgo":
                     url = f"https://html.duckduckgo.com/html/?q={encoded}"
-                    findings.extend(
-                        parse_duckduckgo(_http_get(url, self.config.timeout_seconds), query)
-                    )
+                    text, digest = _fetch_with_digest(url, self.config.timeout_seconds)
+                    batch = parse_duckduckgo(text, query)
+                    for finding in batch:
+                        finding.fetch_url = url
+                        finding.fetch_digest = digest
+                    findings.extend(batch)
             except Exception:
                 continue
         return findings[:limit]
+
+    def _verify_finding(self, finding: ResearchFinding) -> bool | None:
+        """Primary-source verification of a finding.
+
+        Returns True when the primary source independently confirms the
+        finding, False when it contradicts it, and None when verification is
+        impossible (e.g. refetch failed) so the caller cannot downgrade.
+        """
+        if not finding.fetch_url:
+            return None
+        try:
+            text, _digest = _fetch_with_digest(finding.fetch_url, self.config.timeout_seconds)
+        except Exception:
+            return None
+        if finding.source == "github":
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                return False
+            items = data.get("items") or []
+            return any(
+                isinstance(item, dict) and item.get("html_url") == finding.url for item in items
+            )
+        if finding.source == "arxiv":
+            refetched = parse_arxiv(text, finding.query)
+            return any(
+                item.url == finding.url
+                and _normalize_title(item.title) == _normalize_title(finding.title)
+                for item in refetched
+            )
+        return True  # duckduckgo has no canonical primary source to confirm against
 
     def _save_cache(self) -> None:
         write_json(self.cache_path, self._cache)

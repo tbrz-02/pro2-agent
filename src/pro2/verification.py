@@ -10,6 +10,7 @@ from typing import Any
 from pro2.config import MetricSpec, Objective, extract_metric
 from pro2.git_sandbox import GitSandbox
 from pro2.runner import RunResult, run_command
+from pro2.security import SecurityConfig
 
 
 @dataclass
@@ -87,12 +88,14 @@ def measure_metric(
     label: str,
     env: dict[str, str] | None = None,
     memory_limit_mb: int = 0,
+    isolation: SecurityConfig | None = None,
 ) -> MetricMeasurement:
     runs: list[RunResult] = []
     values: list[float] = []
     merged_env = dict(spec.env)
     if env:
         merged_env.update(env)
+    limit_mb = memory_limit_mb or spec.memory_limit_mb
 
     for index in range(spec.repeat):
         run = run_command(
@@ -102,7 +105,9 @@ def measure_metric(
             artifacts_dir=artifacts_dir,
             label=f"{label}-{index + 1}",
             env=merged_env,
-            memory_limit_mb=memory_limit_mb,
+            memory_limit_mb=limit_mb,
+            divergence_regex=spec.divergence_regex,
+            isolation=isolation,
         )
         runs.append(run)
         value = extract_metric(
@@ -183,6 +188,7 @@ def verify_commit(
                 artifacts_dir=artifacts_dir,
                 label=f"{experiment_id}-test-{index + 1}",
                 env={**spec.env, **(env or {})},
+                isolation=objective.security,
             )
             tests.append(test_run)
             if not test_run.ok:
@@ -204,6 +210,7 @@ def verify_commit(
             artifacts_dir,
             f"{experiment_id}-verify",
             env=env,
+            isolation=objective.security,
         )
         if measurement.value is None:
             return VerificationResult(

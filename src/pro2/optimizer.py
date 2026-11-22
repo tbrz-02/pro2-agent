@@ -85,10 +85,14 @@ class EngineeringOptimizer:
         seed: int = 0,
         exploration_constant: float = 1.414,
         nodes: list[MCTSNode] | None = None,
+        direction: str = "maximize",
     ) -> None:
+        if direction not in {"maximize", "minimize"}:
+            raise ValueError("direction must be 'maximize' or 'minimize'")
         self.params = params
         self.max_nodes = max_nodes
         self.gamma = gamma
+        self.direction = direction
         self.exploration_constant = exploration_constant
         self._rng = random.Random(seed)
         self.nodes: dict[str, MCTSNode] = {}
@@ -205,6 +209,10 @@ class EngineeringOptimizer:
         candidates = [n for n in self.nodes.values() if n.metric is not None]
         if not candidates:
             return self.nodes[self.root_id]
+        if self.direction == "minimize":
+            # Paper Eq. 3/4: for minimize objectives the lowest-metric node wins;
+            # ties prefer the most-visited node (stable final selection).
+            return min(candidates, key=lambda n: (n.metric or float("inf"), -n.visits))
         return max(candidates, key=lambda n: (n.metric or float("-inf"), -n.visits))
 
     def to_dict(self) -> dict[str, Any]:
@@ -212,6 +220,7 @@ class EngineeringOptimizer:
             "gamma": self.gamma,
             "max_nodes": self.max_nodes,
             "exploration_constant": self.exploration_constant,
+            "direction": self.direction,
             "root_id": self.root_id,
             "nodes": [node.to_dict() for node in self.nodes.values()],
         }
@@ -231,6 +240,7 @@ class EngineeringOptimizer:
             seed=seed,
             exploration_constant=float(data.get("exploration_constant", 1.414)),
             nodes=nodes,
+            direction=str(data.get("direction", "maximize")),
         )
 
 

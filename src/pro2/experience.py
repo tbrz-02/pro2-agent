@@ -41,6 +41,11 @@ class ExperienceEntry:
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
     uses: int = 0
+    # Certification (DERIVED/ENGINEERING): only engine-verified outcomes are
+    # certified, with a confidence score; unverified lessons are never
+    # authoritative.
+    certified: bool = False
+    confidence: float = 1.0
 
     def to_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)
@@ -73,6 +78,8 @@ class ExperienceBank:
         outcome: str,
         tags: Iterable[str] | None = None,
         evidence: Iterable[str] | None = None,
+        certified: bool = False,
+        confidence: float = 1.0,
     ) -> ExperienceEntry:
         normalized = normalize_error(signature) or signature.strip() or kind
         for entry in self._entries:
@@ -83,6 +90,9 @@ class ExperienceBank:
                 entry.outcome = outcome
                 entry.tags = sorted(set(entry.tags) | set(tags or []))
                 entry.evidence = list(entry.evidence) + list(evidence or [])
+                if certified:
+                    entry.certified = True
+                entry.confidence = max(entry.confidence, float(confidence))
                 entry.updated_at = utc_now()
                 entry.uses += 1
                 self._persist()
@@ -98,22 +108,30 @@ class ExperienceBank:
             outcome=outcome,
             tags=sorted(set(tags or [])),
             evidence=list(evidence or []),
+            certified=bool(certified),
+            confidence=float(confidence),
         )
         self._entries.append(entry)
         self.prune()
         self._persist()
         return entry
 
+    def certified_entries(self) -> list[ExperienceEntry]:
+        return [e for e in self._entries if e.certified]
+
     def search(
         self,
         query: str,
         limit: int = 3,
         tags: Iterable[str] | None = None,
+        certified_only: bool = False,
     ) -> list[ExperienceEntry]:
         tokens = {token for token in re.findall(r"[a-zA-Z0-9_.+-]{2,}", query.lower())}
         tag_filter = {tag.lower() for tag in (tags or [])}
         scored: list[tuple[float, ExperienceEntry]] = []
         for entry in self._entries:
+            if certified_only and not entry.certified:
+                continue
             haystack = " ".join(
                 [
                     entry.signature,
@@ -128,7 +146,7 @@ class ExperienceBank:
                 continue
             if tokens and score == 0:
                 continue
-            score += min(entry.uses, 5) * 0.1
+            score += min(entry.uses, 5) * 0.1 + entry.confidence * 0.2
             scored.append((score, entry))
 
         scored.sort(key=lambda pair: (pair[0], pair[1].updated_at), reverse=True)

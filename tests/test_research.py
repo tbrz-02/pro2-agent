@@ -87,11 +87,15 @@ def test_research_cache_is_used(tmp_path, monkeypatch):
     )
 
     first = engine.search(["cache"])
+    calls_after_first = len(calls)
     second = engine.search(["cache"])
 
     assert len(first) == 1
     assert len(second) == 1
-    assert len(calls) == 1
+    # Second search must be a cache hit: no additional provider calls.
+    assert len(calls) == calls_after_first
+    # Fresh findings are primary-source verified (search != verification).
+    assert first[0].verified is True
 
 
 def test_research_survives_provider_errors(tmp_path, monkeypatch):

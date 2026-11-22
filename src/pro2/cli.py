@@ -10,6 +10,7 @@ from pathlib import Path
 from pro2.config import Objective, load_objective
 from pro2.experience import ExperienceBank
 from pro2.orchestrator import Engine
+from pro2.security import detect_backends, select_backend
 from pro2.util import truncate
 
 
@@ -206,6 +207,11 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         print(f"available providers: {engine.agent.available_providers()}")
     except Exception as exc:  # doctor must report, not crash
         print(f"agent provider: error ({exc})")
+    backends = {k: v for k, v in detect_backends().items() if v}
+    print(
+        f"isolation: enabled={objective.security.enabled} "
+        f"backend={select_backend(objective.security)} available={sorted(backends)}"
+    )
     print(f"state file: {'present' if engine.store.state_file.exists() else 'missing'}")
     return 0
 

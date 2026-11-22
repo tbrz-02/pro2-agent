@@ -37,9 +37,7 @@ def test_review_rejects_when_approved_is_missing(toy_repo, scripted_agent, tmp_p
 
 
 def test_review_rejects_when_agent_reports_not_true(toy_repo, scripted_agent, tmp_path):
-    cmd = _stub_agent(
-        tmp_path, 'import json,sys\nprint(json.dumps({"approved": "yes"}))\n'
-    )
+    cmd = _stub_agent(tmp_path, 'import json,sys\nprint(json.dumps({"approved": "yes"}))\n')
     engine = Engine(make_objective(toy_repo, cmd))
     assert engine._review(_hypothesis(), _stats(), toy_repo)["approved"] is False
 
@@ -64,9 +62,7 @@ def test_review_rejects_when_single_variable_not_reported(toy_repo, scripted_age
     assert engine._review(_hypothesis(), _stats(), toy_repo)["approved"] is False
 
 
-def test_review_rejects_when_reviewer_returns_malformed_payload(
-    toy_repo, scripted_agent, tmp_path
-):
+def test_review_rejects_when_reviewer_returns_malformed_payload(toy_repo, scripted_agent, tmp_path):
     cmd = _stub_agent(tmp_path, 'print("definitely not json")\n')
     engine = Engine(make_objective(toy_repo, cmd))
     assert engine._review(_hypothesis(), _stats(), toy_repo)["approved"] is False
@@ -77,9 +73,7 @@ def test_review_rejects_when_reviewer_returns_no_payload(toy_repo, scripted_agen
     assert engine._review(_hypothesis(), _stats(), toy_repo)["approved"] is False
 
 
-def test_review_hard_constraints_reject_even_when_agent_approves(
-    toy_repo, scripted_agent
-):
+def test_review_hard_constraints_reject_even_when_agent_approves(toy_repo, scripted_agent):
     engine = Engine(
         make_objective(
             toy_repo,
@@ -93,16 +87,27 @@ def test_review_hard_constraints_reject_even_when_agent_approves(
     assert any("run.py" in reason for reason in review["reasons"])
 
 
-def test_review_falls_back_to_heuristic_when_provider_unavailable(
-    toy_repo, scripted_agent
-):
+def test_review_fails_closed_when_provider_unavailable(toy_repo, scripted_agent):
     objective = make_objective(
         toy_repo, scripted_agent, agent={"provider": "local", "timeout_seconds": 30}
     )
     engine = Engine(objective)
     review = engine._review(_hypothesis(), _stats(), toy_repo)
-    assert review["approved"] is True
-    assert review["source"] == "heuristic"
+    # Fail-closed: an unavailable reviewer never silently approves.
+    assert review["approved"] is False
+    assert engine.state.reviewer_unavailable == 1
+    assert engine.state.escalations
+
+
+def test_review_escalates_after_repeated_unavailability(toy_repo, scripted_agent):
+    objective = make_objective(
+        toy_repo, scripted_agent, agent={"provider": "local", "timeout_seconds": 30}
+    )
+    engine = Engine(objective)
+    for _ in range(engine.MAX_REVIEWER_UNAVAILABLE):
+        review = engine._review(_hypothesis(), _stats(), toy_repo)
+        assert review["approved"] is False
+    assert engine._escalation_threshold_reached() is not None
 
 
 def test_review_timeout_is_capped_by_experiment_budget(toy_repo, scripted_agent):

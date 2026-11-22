@@ -61,6 +61,14 @@ class Experiment:
     verification: dict[str, Any] = field(default_factory=dict)
     agent: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Reproducible lineage: snapshots the experiment built on and the best
+    # reference at experiment start (integrity.py).
+    lineage: list[str] = field(default_factory=list)
+    snapshot_digest: str = ""
+    # Review governance records (review_governance.py).
+    reviewer_id: str = ""
+    reviewer_source: str = ""
+    review_digest: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)
