@@ -153,6 +153,29 @@ def test_engine_recovery_cleans_interrupted_experiment(toy_repo, scripted_agent)
     assert engine.state.status == "paused"
 
 
+def test_recover_marks_interrupted_engineering_trials_and_nodes(toy_repo, scripted_agent):
+    from pro2.records import EngineeringTrial
+
+    engine = Engine(make_objective(toy_repo, scripted_agent))
+    engine.initialize()
+    trial = EngineeringTrial(
+        trial_id="ENG-crash",
+        node_id="N-crash",
+        parent_id=None,
+        config={},
+        base_commit=engine.state.best_commit,
+    )
+    trial.status = "running"
+    engine.state.engineering_trials.append(trial.to_dict())
+    engine.state.engineering["nodes"] = [{"node_id": "N-crash", "status": "running"}]
+    engine.store.save_state(engine.state)
+
+    engine.recover()
+
+    assert engine.state.engineering_trials[-1]["status"] == "interrupted"
+    assert engine.state.engineering["nodes"][0]["status"] == "interrupted"
+
+
 def test_engine_writes_report(toy_repo, scripted_agent):
     engine = Engine(make_objective(toy_repo, scripted_agent))
     engine.initialize()

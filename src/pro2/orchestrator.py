@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import re
 import subprocess
 import time
 import uuid
@@ -31,14 +32,14 @@ from pro2.evidence import (
 )
 from pro2.experience import ExperienceBank
 from pro2.experiment import *  # noqa: F403  (re-export convenience)
-from pro2.git_sandbox import GitSandbox, ProtectedPathError, Worktree
+from pro2.git_sandbox import GitError, GitSandbox, ProtectedPathError, Worktree
 from pro2.hypothesis import Hypothesis, select_hypothesis
 from pro2.optimizer import EngineeringOptimizer, apply_config
 from pro2.problem import Problem
 from pro2.records import EngineeringTrial, Experiment
 from pro2.research import ResearchEngine, ResearchFinding
 from pro2.state import EngineState, StateStore
-from pro2.util import utc_now
+from pro2.util import truncate, utc_now
 from pro2.verification import MetricMeasurement, measure_metric, verify_commit
 
 
@@ -297,9 +298,23 @@ class Engine:
             existing_refs = {
                 ref for candidate in problem.candidate_solutions for ref in candidate.references
             }
-            for finding in findings[:2]:
+            problem_tokens = _word_tokens(problem.description)
+            attached = 0
+            for finding in findings:
+                if attached >= 2:
+                    break
+                # Only verified findings become candidates; unverified search
+                # results stay in the research log but are never trusted.
+                if not finding.verified:
+                    continue
+                if not problem_tokens or not problem_tokens.intersection(
+                    _word_tokens(f"{finding.title} {finding.summary}")
+                ):
+                    continue
                 if finding.url in existing_refs:
                     continue
+                attached += 1
+                existing_refs.add(finding.url)
                 candidate_id = f"C{len(problem.candidate_solutions) + 1:03d}"
                 if problem.get_candidate(candidate_id):
                     continue
@@ -541,6 +556,10 @@ class Engine:
                             feedback,
                         ),
                         worktree.path,
+                        timeout_seconds=min(
+                            self.objective.agent.timeout_seconds,
+                            self.objective.budget.max_experiment_seconds,
+                        ),
                     )
                     agent_cost += result.cost_usd
                     experiment.agent = result.to_dict()
@@ -574,7 +593,9 @@ class Engine:
                 experiment.review = review
                 if review.get("approved"):
                     break
-                feedback = "\n".join(review.get("reasons", [])) or "review rejected"
+                feedback = truncate(
+                    "\n".join(review.get("reasons", [])) or "review rejected", 1200
+                )
                 hypothesis.review_feedback = feedback
                 if attempt + 1 >= attempts:
                     experiment.reason = "reviewer rejected: " + feedback
@@ -700,7 +721,9 @@ class Engine:
         )
 
     # ----------------------------------------------------------------- review
-    def _review(self, hypothesis: Hypothesis, stats: Any, worktree: Path) -> dict[str, Any]:
+    def _heuristic_review(
+        self, hypothesis: Hypothesis, stats: Any, worktree: Path
+    ) -> dict[str, Any]:
         violations: list[str] = []
         changed = list(stats.changed_paths) + list(stats.untracked or [])
         if not changed:
@@ -724,17 +747,28 @@ class Engine:
                     violations.append(f"protected path modified: {changed_path}")
             if not self.objective.constraints.allow_test_edits and _is_test_path(changed_path):
                 violations.append(f"test file modified: {changed_path}")
-
-        reasons = list(violations)
         if violations:
             return {
                 "approved": False,
                 "single_variable": False,
-                "reasons": reasons,
-                "violations": violations,
+                "reasons": list(violations),
+                "violations": list(violations),
                 "source": "heuristic",
             }
+        return {
+            "approved": True,
+            "single_variable": True,
+            "reasons": ["heuristic review passed"],
+            "violations": [],
+            "source": "heuristic",
+        }
 
+    def _review(self, hypothesis: Hypothesis, stats: Any, worktree: Path) -> dict[str, Any]:
+        # Hard constraints are a mandatory gate: a violating diff rejects even
+        # if the reviewer agent claims approval.
+        heuristic = self._heuristic_review(hypothesis, stats, worktree)
+        if not heuristic["approved"]:
+            return heuristic
         diff_summary = (
             f"{len(stats.changed_paths)} files, +{stats.added}/-{stats.removed}\n"
             + "\n".join(stats.changed_paths)
@@ -744,31 +778,57 @@ class Engine:
                 "REVIEW",
                 build_review_prompt(self.objective, hypothesis, stats.patch, diff_summary),
                 worktree,
+                timeout_seconds=self._review_timeout(),
             )
-            if result.cost_usd:
-                self._add_cost(result.cost_usd)
-            if isinstance(payload, dict):
-                return {
-                    "approved": bool(payload.get("approved", True)),
-                    "single_variable": bool(payload.get("single_variable", True)),
-                    "reasons": [str(x) for x in payload.get("reasons", [])],
-                    "violations": [str(x) for x in payload.get("violations", [])],
-                    "source": "agent",
-                }
         except AgentError:
-            pass
+            return heuristic
+        if result.cost_usd:
+            self._add_cost(result.cost_usd)
+        if not isinstance(payload, dict):
+            return {
+                "approved": False,
+                "single_variable": False,
+                "reasons": ["reviewer returned a missing or malformed review"],
+                "violations": [],
+                "source": "agent",
+            }
+        agent_violations = [str(x) for x in payload.get("violations", []) if str(x).strip()]
+        if payload.get("approved") is not True or agent_violations:
+            return {
+                "approved": False,
+                "single_variable": False,
+                "reasons": agent_violations or ["reviewer did not approve the change"],
+                "violations": agent_violations,
+                "source": "agent",
+            }
+        if payload.get("single_variable") is not True:
+            return {
+                "approved": False,
+                "single_variable": False,
+                "reasons": ["reviewer flagged multiple variables in the diff"],
+                "violations": [],
+                "source": "agent",
+            }
         return {
             "approved": True,
             "single_variable": True,
-            "reasons": ["heuristic review passed"],
+            "reasons": [str(x) for x in payload.get("reasons", []) if str(x).strip()]
+            or ["agent approved"],
             "violations": [],
-            "source": "heuristic",
+            "source": "agent",
         }
 
+    def _review_timeout(self) -> float:
+        return min(
+            self.objective.agent.timeout_seconds, self.objective.budget.max_experiment_seconds
+        )
+
     # ----------------------------------------------------------- agent helper
-    def _run_agent(self, task: str, prompt: str, cwd: Path) -> AgentResult:
+    def _run_agent(
+        self, task: str, prompt: str, cwd: Path, timeout_seconds: float | None = None
+    ) -> AgentResult:
         try:
-            return self.agent.run(task, prompt, cwd)
+            return self.agent.run(task, prompt, cwd, timeout_seconds=timeout_seconds)
         except AgentError as exc:
             return AgentResult(ok=False, error=str(exc), provider="none")
 
@@ -793,7 +853,9 @@ class Engine:
     def _experience_for(self, problem: Problem, query: str) -> str:
         if not self.experience:
             return ""
-        entries = self.experience.search(f"{problem.description} {query}", limit=3)
+        entries = self.experience.search(
+            f"{problem.description} {query}", limit=self.objective.experience.retrieval_limit
+        )
         return self.experience.format_for_prompt(entries)
 
     def _record_experience(
@@ -944,7 +1006,8 @@ class Engine:
         self.state.phase = "engineering"
         self.state.engineering.setdefault("root_commit", self.state.best_commit)
         root_commit = self.state.engineering.get("root_commit") or self.state.best_commit
-        root_metric = self.state.best_metric or 0.0
+        root_metric = self.state.engineering.get("root_metric") or (self.state.best_metric or 0.0)
+        self.state.engineering["root_metric"] = root_metric
         optimizer = (
             EngineeringOptimizer.from_dict(
                 config.params,
@@ -1084,8 +1147,25 @@ class Engine:
         self.state.phase = "done"
         self.state.engineering = optimizer.to_dict()
         self.state.engineering["root_commit"] = root_commit
+        self.state.engineering["root_metric"] = root_metric
+        self._merge_best_into_primary(optimizer.best())
         self.store.save_state(self.state)
         self.store.append_event("engineering_finished", best_node=optimizer.best().node_id)
+
+    def _merge_best_into_primary(self, best: Any) -> None:
+        """Paper: merge the highest-validation trajectory back into the primary branch."""
+        if best.commit is None or best.metric is None:
+            return
+        try:
+            merged = self.sandbox.merge_into_primary(best.commit, "pro2 engineering")
+        except GitError as exc:
+            self.store.append_event("engineering_merge_failed", error=str(exc))
+            return
+        if merged:
+            self.state.metadata["engineering_merged_commit"] = merged
+            self.store.append_event(
+                "engineering_merged_best", commit=merged, metric=best.metric
+            )
 
     # --------------------------------------------------------------- recovery
     def recover(self) -> EngineState:
@@ -1120,6 +1200,17 @@ class Engine:
                 self.store.append_event(
                     "recovered", experiment_id=experiment_id, action="interrupted"
                 )
+            interrupted = 0
+            for trial in self.state.engineering_trials:
+                if trial.get("status") == "running":
+                    trial["status"] = "interrupted"
+                    interrupted += 1
+            for node in self.state.engineering.get("nodes", []):
+                if node.get("status") in {"running", "pending"}:
+                    node["status"] = "interrupted"
+            if interrupted:
+                self.store.save_state(self.state)
+                self.store.append_event("engineering_trials_interrupted", count=interrupted)
             self.sandbox.cleanup_orphans(active_paths=set())
             return self.state
 
@@ -1253,6 +1344,10 @@ class Engine:
 
 def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
     return max(low, min(high, value))
+
+
+def _word_tokens(text: str) -> set[str]:
+    return {t for t in re.findall(r"[a-z0-9_]{3,}", text.lower())}
 
 
 def _optional_float(value: Any) -> float | None:

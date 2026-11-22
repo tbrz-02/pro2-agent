@@ -186,9 +186,13 @@ class EngineeringOptimizer:
         node.duration_seconds = duration_seconds
         node.commit = commit
         node.status = status
+        node.visits += 1
+        if status == "failed":
+            # Paper: failed branches are purged (hard rollback); no reward is
+            # credited to the node or backpropagated to its ancestors.
+            return 0.0
         value = reward(delta, duration_seconds, self.gamma)
         node.reward_sum += value
-        node.visits += 1
         parent_id = node.parent_id
         while parent_id:
             parent = self.nodes[parent_id]

@@ -141,26 +141,39 @@ The engine is provider-agnostic. `provider: "auto"` picks the first available:
 | Provider | Requirements | Notes |
 | --- | --- | --- |
 | `command` | `agent.command` is a list | Prompt is passed on stdin. Used by tests and scripted agents. |
-| `opencode` | `opencode` CLI installed | Runs `opencode run --auto --archived --format json -m <model>`; parses streaming JSON, text and cost. |
+| `opencode` | `opencode` CLI installed | Runs `opencode run --auto --archived --format json -m <model>`; parses streaming JSON, text and cost. `--auto` auto-approves permissions that are not explicitly denied — the engine still gates every diff through the fail-closed reviewer and protected-path checks, so do not widen `constraints` without review. |
 | `claude` | `claude` CLI installed and logged in | Runs `claude -p --output-format json --dangerously-skip-permissions`. Unauthenticated installs fail with a clear error. |
 | `http` | `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` (or `agent.api_key_env`) | OpenAI-compatible `/chat/completions` or Anthropic `/v1/messages`; optional `base_url`, `model`, `cost_per_1k_tokens`. |
 | `local` | none | No model call; the engine falls back to deterministic heuristic diagnosis and seeded hypotheses. |
 
-If a provider fails, the engine records the failure and continues with the
-heuristic path rather than inventing success.
+If a provider fails to start or returns nothing usable (the `local` provider
+case), the engine records the failure and falls back to the heuristic review
+rather than inventing success. If the review agent is available but its review
+is malformed, missing an explicit approval, reports multiple variables, or
+lists violations, the candidate is rejected — the reviewer is fail-closed.
+Reviewer feedback fed back to the implementer is truncated so agent-written
+text stays bounded.
 
 ## How verification works
 
 1. The implementer works in a throwaway worktree on branch `pro2/exp/<id>`.
 2. The engine detects if the agent modified the main checkout or the state dir.
 3. A reviewer (agent, plus hard constraints) checks protected paths, file and
-   line budgets, test edits and single-variable intent.
+   line budgets, test edits and single-variable intent. The hard constraints
+   are a mandatory gate: a diff touching a protected or forbidden path, the
+   test suite, or exceeding the diff budgets rejects the candidate even if the
+   reviewer agent approves. The reviewer is fail-closed: missing, malformed,
+   incomplete or failed reviews reject.
 4. The engine commits, then creates a **separate** detached worktree.
 5. Tests and the metric command run there; metric values must be finite.
 6. Acceptance requires the configured direction, `min_delta` and optional
    absolute `target`.
 7. Accepted commits update `refs/pro2/best`; rejected worktrees and branches are
    deleted. Rollback is a Git operation, not a promise.
+8. Every engineering trial measures against the persisted engineering root
+   metric; after budget exhaustion the highest-validation engineering
+   trajectory is merged back into the primary branch as the final reference
+   model.
 
 ## Configuration reference
 
@@ -175,7 +188,9 @@ heuristic path rather than inventing success.
   test-edit policy, clean-worktree requirement.
 - `research`: GitHub/arXiv/DuckDuckGo providers, query/result limits, cache.
 - `engineering`: MCTS over JSON/env/text parameters; reward
-  `Δmetric - γ·ln(T_exec)`.
+  `Δmetric - γ·ln(T_exec)`. Trials are measured against the persisted
+  engineering root metric; the best trajectory is merged into the primary
+  branch when the budget ends.
 - `experience`: persistent failure/success signatures with retrieval limits.
 - `seed_problems` / `seed_hypotheses`: skip agent diagnosis and inject known
   starting points (useful for reproducible runs and tests).
@@ -208,7 +223,7 @@ interrupted experiment is marked `interrupted` and cleaned by `pro2 resume`.
 ```
 pro2-agent/
 ├── src/pro2/                  # engine core — stdlib-only Python 3.12
-├── tests/                     # integration tests (pytest, 138)
+├── tests/                     # integration tests (pytest, 154)
 ├── docs/paper-algorithm.md    # verified paper-mechanism spec
 ├── paper/                     # extracted paper: original.pdf, extracted/, figures/
 ├── scripts/analyze_paper.py   # paper extraction/analysis helper
@@ -241,7 +256,7 @@ Core modules in `src/pro2/`:
 ## Development
 
 ```bash
-uv run pytest -q          # 138 tests
+uv run pytest -q          # 154 tests
 uv run ruff check .       # lint
 uv run ruff format .      # format
 just check                # lint + tests
@@ -254,8 +269,12 @@ accept/reject cycle. No network access or paid API is required.
 ## Scope and limitations
 
 - No ML libraries, training loops or benchmark harnesses.
-- Research providers are best-effort; offline runs simply produce no findings.
+- Research providers are best-effort; offline runs simply produce no findings
+  and never treat them as facts (unverified findings are not attached as
+  candidates).
 - Agent quality depends on the configured provider; deterministic heuristics
   keep the loop alive when a provider is unavailable.
+- The reviewer is fail-closed; protected, forbidden and test paths are
+  rejected even when a reviewer agent approves.
 - The engine never merges into your branch automatically. Accepted experiments
   are kept on branches and `refs/pro2/best`; integrating them is your decision.

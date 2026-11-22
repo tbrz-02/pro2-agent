@@ -161,6 +161,30 @@ class GitSandbox:
         if violations:
             raise ProtectedPathError("experiment touched protected paths: " + ", ".join(violations))
 
+    def merge_into_primary(self, commit: str, message: str) -> str | None:
+        """Merge a commit back into the primary branch; returns the merge commit or None.
+
+        The paper requires the highest-validation engineering trajectory to be
+        merged back into the primary branch as the final reference model.
+        """
+        branch = self._git("rev-parse", "--abbrev-ref", "HEAD").strip()
+        if not branch or branch.startswith("(HEAD detached"):
+            return None
+        result = subprocess.run(
+            ["git", "merge", "--no-edit", "-m", message, commit],
+            cwd=str(self.repo),
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise GitError(
+                f"git merge failed ({result.returncode}): "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+        if "already up to date" in result.stdout.lower():
+            return None
+        return self._git("rev-parse", "HEAD").strip()
+
     def remove_experiment(self, worktree: Worktree) -> None:
         self._remove_worktree_path(worktree.path)
         self._git("branch", "-D", worktree.branch, check=False)
