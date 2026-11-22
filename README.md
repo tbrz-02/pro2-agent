@@ -203,6 +203,41 @@ Everything lives under the objective's state directory (default `.pro2/`):
 State writes are atomic, a `fcntl` lock prevents concurrent engines, and an
 interrupted experiment is marked `interrupted` and cleaned by `pro2 resume`.
 
+## Repository structure
+
+```
+pro2-agent/
+├── src/pro2/                  # engine core — stdlib-only Python 3.12
+├── tests/                     # integration tests (pytest, 138)
+├── docs/paper-algorithm.md    # verified paper-mechanism spec
+├── paper/                     # extracted paper: original.pdf, extracted/, figures/
+├── scripts/analyze_paper.py   # paper extraction/analysis helper
+├── experiments/               # experiment storage (gitignored, .gitkeep only)
+├── logs/                      # runtime logs (gitignored, .gitkeep only)
+├── state/                     # runtime state dirs (gitignored, .gitkeep only)
+├── pyproject.toml             # package metadata + console script `pro2`
+├── justfile                   # dev commands (test/lint/check/format/security/watch)
+└── .gitignore, README.md
+```
+
+Core modules in `src/pro2/`:
+
+| Module | Role |
+| --- | --- |
+| `config.py` | Objective config: metrics, budgets, constraints, agents, research, engineering, seeds |
+| `records.py`, `experiment.py` | Evidence, Experiment, EngineeringTrial records |
+| `problem.py`, `problem_state.py`, `candidate_solution.py`, `hypothesis.py` | Problem State, candidates, hypotheses; paper priority `Pri = belief/(attempts+1)` |
+| `runner.py` | Bounded subprocess execution (timeout/memory/stall/divergence, process-group kill) |
+| `git_sandbox.py` | Worktrees, branches, rollback, `refs/pro2/best`, protected paths |
+| `verification.py` | Independent verification in a fresh worktree (tests + metric) |
+| `agents.py` | Provider-agnostic agent layer + machine-readable prompts |
+| `research.py` | GitHub/ArXiv/DuckDuckGo research with response cache |
+| `evidence.py` | Environment observation, diagnostics, heuristic diagnosis |
+| `optimizer.py` | Cost-aware MCTS/UCT over engineering parameters |
+| `orchestrator.py` | Engine: the full loop, review, supervision, engineering, recovery, report |
+| `experience.py` | Experience Bank (normalized signatures, search, persistence) |
+| `cli.py`, `__main__.py` | `pro2` command and `python -m pro2` |
+
 ## Development
 
 ```bash
