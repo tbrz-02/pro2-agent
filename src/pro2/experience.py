@@ -46,6 +46,14 @@ class ExperienceEntry:
     # authoritative.
     certified: bool = False
     confidence: float = 1.0
+    # Rich lesson structure (Paper-fidelity strengthening): separate raw
+    # observations from inferred causes, verified fixes, and reproducibility
+    # evidence so retrieval can distinguish proven facts from guesses.
+    observation: str = ""
+    causal_hypothesis: str = ""
+    verified_fix: str = ""
+    reproducible: str = ""
+    evidence_refs: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)
@@ -54,6 +62,20 @@ class ExperienceEntry:
     def from_dict(cls, data: dict[str, Any]) -> ExperienceEntry:
         known = set(cls.__dataclass_fields__)
         return cls(**{k: v for k, v in data.items() if k in known})
+
+    def search_text(self) -> str:
+        return " ".join(
+            [
+                self.signature,
+                self.context,
+                self.root_cause,
+                self.fix,
+                self.observation,
+                self.causal_hypothesis,
+                self.verified_fix,
+                " ".join(self.tags),
+            ]
+        ).lower()
 
 
 class ExperienceBank:
@@ -80,6 +102,11 @@ class ExperienceBank:
         evidence: Iterable[str] | None = None,
         certified: bool = False,
         confidence: float = 1.0,
+        observation: str = "",
+        causal_hypothesis: str = "",
+        verified_fix: str = "",
+        reproducible: str = "",
+        evidence_refs: Iterable[str] | None = None,
     ) -> ExperienceEntry:
         normalized = normalize_error(signature) or signature.strip() or kind
         for entry in self._entries:
@@ -87,9 +114,14 @@ class ExperienceBank:
                 entry.context = context or entry.context
                 entry.root_cause = root_cause or entry.root_cause
                 entry.fix = fix or entry.fix
-                entry.outcome = outcome
+                entry.outcome = outcome or entry.outcome
                 entry.tags = sorted(set(entry.tags) | set(tags or []))
                 entry.evidence = list(entry.evidence) + list(evidence or [])
+                entry.observation = entry.observation or observation
+                entry.causal_hypothesis = entry.causal_hypothesis or causal_hypothesis
+                entry.verified_fix = entry.verified_fix or verified_fix
+                entry.reproducible = entry.reproducible or reproducible
+                entry.evidence_refs = sorted(set(entry.evidence_refs) | set(evidence_refs or []))
                 if certified:
                     entry.certified = True
                 entry.confidence = max(entry.confidence, float(confidence))
@@ -110,6 +142,11 @@ class ExperienceBank:
             evidence=list(evidence or []),
             certified=bool(certified),
             confidence=float(confidence),
+            observation=observation,
+            causal_hypothesis=causal_hypothesis,
+            verified_fix=verified_fix,
+            reproducible=reproducible,
+            evidence_refs=list(evidence_refs or []),
         )
         self._entries.append(entry)
         self.prune()
@@ -132,15 +169,7 @@ class ExperienceBank:
         for entry in self._entries:
             if certified_only and not entry.certified:
                 continue
-            haystack = " ".join(
-                [
-                    entry.signature,
-                    entry.context,
-                    entry.root_cause,
-                    entry.fix,
-                    " ".join(entry.tags),
-                ]
-            ).lower()
+            haystack = entry.search_text()
             score = sum(1 for token in tokens if token in haystack)
             if tag_filter and not tag_filter.intersection({t.lower() for t in entry.tags}):
                 continue
@@ -159,9 +188,17 @@ class ExperienceBank:
                 f"- [{entry.kind}] {entry.signature}\n"
                 f"  context: {entry.context}\n"
                 f"  root cause: {entry.root_cause}\n"
-                f"  fix: {entry.fix}\n"
-                f"  outcome: {entry.outcome}"
+                f"  fix: {entry.fix}"
             )
+            if entry.observation:
+                lines.append(f"  observation: {entry.observation}")
+            if entry.causal_hypothesis:
+                lines.append(f"  causal hypothesis: {entry.causal_hypothesis}")
+            if entry.verified_fix:
+                lines.append(f"  verified fix: {entry.verified_fix}")
+            if entry.reproducible:
+                lines.append(f"  reproducible: {entry.reproducible}")
+            lines.append(f"  outcome: {entry.outcome}")
         return "\n".join(lines)
 
     def prune(self) -> None:

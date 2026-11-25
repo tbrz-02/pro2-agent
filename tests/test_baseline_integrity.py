@@ -14,9 +14,7 @@ def git(repo, *args):
     ).stdout.strip()
 
 
-def test_engineering_persists_root_metric_and_merges_best_to_primary(
-    toy_repo, scripted_agent
-):
+def test_engineering_persists_root_metric_and_merges_best_to_primary(toy_repo, scripted_agent):
     objective = make_objective(
         toy_repo,
         scripted_agent,
@@ -54,9 +52,7 @@ def test_engineering_persists_root_metric_and_merges_best_to_primary(
     assert rc == 0
 
 
-def test_engineering_trials_fail_when_protected_path_changes(
-    toy_repo, scripted_agent
-):
+def test_engineering_trials_fail_when_protected_path_changes(toy_repo, scripted_agent):
     objective = make_objective(
         toy_repo,
         scripted_agent,

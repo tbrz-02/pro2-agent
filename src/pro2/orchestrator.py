@@ -527,10 +527,12 @@ class Engine:
         # Paper: adaptive rescheduling — boost under-attempted problems whose
         # hypotheses keep being falsified, then re-score pending hypotheses.
         adaptive_reschedule(self.state)
+        resolved = {p.problem_id for p in self.state.identified_problems if p.status == "resolved"}
         hypothesis = select_hypothesis(
             self.state.pending_hypotheses(),
             self.state.candidate_beliefs(),
             self.state.problem_attempts(),
+            resolved_problems=resolved,
         )
         if hypothesis is None:
             self._refill_hypotheses()
@@ -538,6 +540,7 @@ class Engine:
                 self.state.pending_hypotheses(),
                 self.state.candidate_beliefs(),
                 self.state.problem_attempts(),
+                resolved_problems=resolved,
             )
         if hypothesis is None:
             self.state.stop_reason = "no pending hypotheses"
@@ -717,6 +720,18 @@ class Engine:
                 self.sandbox.set_best(commit)
                 self.state.consecutive_failures = 0
                 self.state.insights.append(f"{hypothesis.title}: {verification.reason}")
+                # Three-state taxonomy: the problem reached the `resolved`
+                # state on an independently verified, accepted candidate.
+                if problem.set_status(
+                    "resolved",
+                    reason=f"candidate {candidate.candidate_id} accepted: {verification.reason}",
+                    evidence=experiment.experiment_id,
+                ):
+                    self.store.append_event(
+                        "problem_transition",
+                        problem_id=problem.problem_id,
+                        transition=problem.status_reasons[-1],
+                    )
                 self._record_experience(experiment, hypothesis, problem, candidate, accepted=True)
                 experiment.status = "accepted"
             else:
@@ -999,24 +1014,39 @@ class Engine:
     ) -> None:
         if not self.experience:
             return
-        signature = (
-            f"{problem.problem_id}: {problem.description} -> {hypothesis.title}"
-            if accepted
-            else f"{problem.problem_id}: {experiment.reason or 'rejected'}"
+        measurement = experiment.verification or {}
+        outcome = "accepted" if accepted else "rejected"
+        observation = (
+            f"experiment {experiment.experiment_id} {outcome}: "
+            f"metric={measurement.get('candidate_metric')} delta={measurement.get('delta')}"
         )
         self.experience.add(
             kind="success" if accepted else "failure",
-            signature=signature,
+            signature=(
+                f"{problem.problem_id}: {problem.description} -> {hypothesis.title}"
+                if accepted
+                else f"{problem.problem_id}: {experiment.reason or 'rejected'}"
+            ),
             context=f"{self.objective.name} / {problem.description}",
             root_cause=problem.description,
             fix=hypothesis.modification if accepted else f"avoid: {hypothesis.modification}",
-            outcome="accepted" if accepted else "rejected",
+            outcome=outcome,
             tags=[self.objective.name, problem.problem_id, candidate.candidate_id],
             evidence=[experiment.experiment_id],
             # Certification: only independently verified outcomes are
             # authoritative; unverified lessons carry low confidence.
             certified=accepted,
             confidence=1.0 if accepted else 0.2,
+            observation=observation,
+            causal_hypothesis=hypothesis.title or hypothesis.modification,
+            verified_fix=hypothesis.modification if accepted else "",
+            reproducible=(
+                f"commit={experiment.commit} delta={experiment.delta} "
+                f"metric={measurement.get('candidate_metric')}"
+                if accepted
+                else ""
+            ),
+            evidence_refs=[experiment.experiment_id, hypothesis.hypothesis_id],
         )
 
     # ------------------------------------------------------------------- run
@@ -1027,6 +1057,17 @@ class Engine:
     ) -> EngineState:
         if self.state.best_commit is None:
             self.initialize()
+
+        # Resume mid-engineering: the science loop already ran; continue the
+        # persisted MCTS tree instead of re-entering science.
+        if self.state.phase == "engineering":
+            self.run_engineering()
+            self.state.status = "completed"
+            self.state.phase = "done"
+            self.write_report()
+            self.store.save_state(self.state)
+            self.store.append_event("run_finished", status=self.state.status)
+            return self.state
 
         self.state.status = "running"
         self.state.run_started_at = utc_now()
@@ -1047,6 +1088,7 @@ class Engine:
             if reason:
                 status = "budget_exhausted"
                 self.state.stop_reason = reason
+                self._settle_problems()
                 break
             escalation = self._escalation_threshold_reached()
             if escalation:
@@ -1059,6 +1101,7 @@ class Engine:
                 if not self.state.stop_reason:
                     self.state.stop_reason = "no runnable hypotheses"
                 break
+            self._runaway_check(experiment)
             if (
                 len(self.state.experiments) % max(1, self.objective.supervision_interval) == 0
                 and not self.supervise()
@@ -1082,6 +1125,62 @@ class Engine:
             "run_finished", status=self.state.status, reason=self.state.stop_reason
         )
         return self.state
+
+    # ------------------------------------------------------- three-state taxonomy
+    def _problem_hypothesis_count(self, problem_id: str) -> int:
+        return sum(1 for h in self.state.hypotheses if h.problem_id == problem_id)
+
+    def _settle_problems(self) -> None:
+        """Evidence-backed `resource_limited` transitions on budget exhaustion.
+
+        Problems that are still unresolved and have no accepted candidate
+        have hit the resource limits of the run; that is the third state of
+        the Pro² taxonomy.
+        """
+        for problem in self.state.identified_problems:
+            if problem.status == "resolved":
+                continue
+            if any(
+                h.status == "accepted"
+                for h in self.state.hypotheses
+                if h.problem_id == problem.problem_id
+            ):
+                problem.set_status("resolved", reason="a candidate was accepted")
+                continue
+            problem.set_status(
+                "resource_limited",
+                reason=self.state.stop_reason or "run budget exhausted",
+                evidence=(
+                    f"attempts={problem.attempts}, "
+                    f"hypotheses={self._problem_hypothesis_count(problem.problem_id)}"
+                ),
+            )
+        if any(
+            p.status_reasons and p.status_reasons[-1]["to"] == "resource_limited"
+            for p in self.state.identified_problems
+        ):
+            self.store.append_event(
+                "problem_transition", transitions=self.state.problem_transitions()
+            )
+
+    def _runaway_check(self, experiment: Experiment) -> None:
+        """Mark problems resource-limited when an experiment stalls at the budget cap."""
+        if experiment is None or experiment.status != "failed":
+            return
+        if experiment.duration_seconds < self.objective.budget.max_experiment_seconds:
+            return
+        problem = self.state.get_problem(experiment.problem_id)
+        if problem and problem.status == "unresolved":
+            problem.set_status(
+                "resource_limited",
+                reason=experiment.reason or "experiment exceeded the time budget",
+                evidence=f"experiment={experiment.experiment_id}",
+            )
+            self.store.append_event(
+                "problem_transition",
+                problem_id=problem.problem_id,
+                transition=problem.status_reasons[-1],
+            )
 
     def _budget_reason(
         self,
@@ -1131,6 +1230,10 @@ class Engine:
             if result.cost_usd:
                 self._add_cost(result.cost_usd)
         except AgentError:
+            # Fail closed: an unavailable PI supervisor must never be silent;
+            # repeated unavailability pauses the run for human triage.
+            self.state.pi_unavailable += 1
+            self._escalate("PI supervisor unavailable")
             return True
         if not isinstance(payload, dict):
             # Ambiguous PI output: record it, escalate, keep running but
@@ -1152,6 +1255,8 @@ class Engine:
             return (
                 f"reviewer unavailable {self.state.reviewer_unavailable} times; escalate to human"
             )
+        if self.state.pi_unavailable >= self.MAX_PI_MALFORMED:
+            return f"PI supervisor unavailable {self.state.pi_unavailable} times; escalate to human"
         if self.state.pi_malformed >= self.MAX_PI_MALFORMED:
             return f"PI supervisor ambiguous {self.state.pi_malformed} times; escalate to human"
         return None
@@ -1262,6 +1367,7 @@ class Engine:
                     metric=metric,
                     commit=commit,
                     status="completed" if metric is not None else "failed",
+                    accepted=verification.accepted,
                 )
                 trial.commit = commit
                 trial.metric = metric
@@ -1362,7 +1468,7 @@ class Engine:
                 )
             interrupted = 0
             for trial in self.state.engineering_trials:
-                if trial.get("status") == "running":
+                if trial.get("status") in {"running", "pending"}:
                     trial["status"] = "interrupted"
                     interrupted += 1
             for node in self.state.engineering.get("nodes", []):
@@ -1406,6 +1512,10 @@ class Engine:
 
     def status_summary(self) -> str:
         pending = len(self.state.pending_hypotheses())
+        problem_status_counts = {
+            status: sum(1 for p in self.state.identified_problems if p.status == status)
+            for status in sorted({p.status for p in self.state.identified_problems})
+        }
         lines = [
             f"Objective: {self.objective.name}",
             f"Status: {self.state.status}",
@@ -1413,6 +1523,7 @@ class Engine:
             f"Baseline: {self.state.baseline_metric} @ {self.state.baseline_commit}",
             f"Best: {self.state.best_metric} @ {self.state.best_commit}",
             f"Problems: {len(self.state.identified_problems)}",
+            f"Problem statuses: {problem_status_counts}",
             f"Hypotheses: {len(self.state.hypotheses)} ({pending} pending)",
             f"Experiments: {len(self.state.experiments)}",
             f"Budget used: {json.dumps(self.state.budget_used)}",
@@ -1451,7 +1562,8 @@ class Engine:
         ]
         for problem in self.state.identified_problems:
             lines.append(
-                f"### {problem.problem_id}: {problem.description}\n"
+                f"### {problem.problem_id}: {problem.description} "
+                f"(status: {problem.status})\n"
                 f"- severity: {problem.severity}\n"
                 f"- attempts: {problem.attempts}\n"
                 f"- evidence: {', '.join(problem.evidence_ids) or '(none)'}\n"

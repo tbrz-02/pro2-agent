@@ -65,9 +65,16 @@ def test_enforce_isolation_fails_closed_when_no_backend(monkeypatch):
         "pro2.security.detect_backends",
         lambda: {k: False for k in ("unshare", "docker", "bwrap", "nsjail", "unshare_net")},
     )
-    config = SecurityConfig(enabled=True, backend="none")
+    config = SecurityConfig(enabled=True, backend="auto")
     with pytest.raises(IsolationError):
         enforce_isolation(config, ["echo", "hi"], "/tmp")
+
+
+def test_enforce_isolation_backend_none_is_opt_out():
+    # Explicit "none" backend: no boundary, but never an error.
+    config = SecurityConfig(enabled=True, backend="none")
+    command, _ = enforce_isolation(config, ["echo", "hi"], "/tmp")
+    assert command == ["echo", "hi"]
 
 
 def test_enforce_isolation_unshare_wrap_when_available():

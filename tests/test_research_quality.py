@@ -15,20 +15,40 @@ def test_attach_requires_verified_and_relevant_findings(toy_repo, scripted_agent
 
     findings = [
         ResearchFinding(
-            finding_id="R-1", title="sparse matrix optimization guide", url="https://a",
-            summary="matrix multiply optimization", source="github", query="q", verified=True,
+            finding_id="R-1",
+            title="sparse matrix optimization guide",
+            url="https://a",
+            summary="matrix multiply optimization",
+            source="github",
+            query="q",
+            verified=True,
         ),
         ResearchFinding(
-            finding_id="R-2", title="unrelated deployment notes", url="https://b",
-            summary="s", source="github", query="q", verified=True,
+            finding_id="R-2",
+            title="unrelated deployment notes",
+            url="https://b",
+            summary="s",
+            source="github",
+            query="q",
+            verified=True,
         ),
         ResearchFinding(
-            finding_id="R-3", title="sparse matrix tuning guide", url="https://d",
-            summary="s", source="github", query="q", verified=True,
+            finding_id="R-3",
+            title="sparse matrix tuning guide",
+            url="https://d",
+            summary="s",
+            source="github",
+            query="q",
+            verified=True,
         ),
         ResearchFinding(
-            finding_id="R-4", title="sparse matrix guide", url="https://c",
-            summary="s", source="duckduckgo", query="q", verified=False,
+            finding_id="R-4",
+            title="sparse matrix guide",
+            url="https://c",
+            summary="s",
+            source="duckduckgo",
+            query="q",
+            verified=False,
         ),
     ]
     engine._attach_research_candidates(findings)

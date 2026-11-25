@@ -25,6 +25,9 @@ class MetricSpec:
     env: dict[str, str] = field(default_factory=dict)
     divergence_regex: str | None = None
     memory_limit_mb: int = 0
+    # Noise-aware acceptance (verification.py): a candidate must beat
+    # min_delta by at least noise_weight * candidate_std to be accepted.
+    noise_weight: float = 0.0
 
     def __post_init__(self) -> None:
         if not self.command.strip():
@@ -47,6 +50,8 @@ class MetricSpec:
                 raise ValueError(f"invalid divergence_regex: {exc}") from exc
         if self.memory_limit_mb < 0:
             raise ValueError("memory_limit_mb must be >= 0")
+        if self.noise_weight < 0:
+            raise ValueError("noise_weight must be >= 0")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -58,6 +63,7 @@ class MetricSpec:
             "env": dict(self.env),
             "divergence_regex": self.divergence_regex,
             "memory_limit_mb": self.memory_limit_mb,
+            "noise_weight": self.noise_weight,
         }
 
     @classmethod
@@ -71,6 +77,7 @@ class MetricSpec:
             env={str(k): str(v) for k, v in (data.get("env") or {}).items()},
             divergence_regex=data.get("divergence_regex"),
             memory_limit_mb=int(data.get("memory_limit_mb", 0)),
+            noise_weight=float(data.get("noise_weight", 0.0)),
         )
 
 

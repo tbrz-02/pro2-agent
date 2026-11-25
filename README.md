@@ -40,6 +40,19 @@ objective + measurable metric
   optional engineering phase: cost-aware MCTS/UCT over config parameters
 ```
 
+## Three-state problem taxonomy
+
+Every problem in the Problem State moves through the Pro² taxonomy
+`unresolved → resource_limited/resolved` with evidence-backed transitions:
+
+- **`resolved`** (terminal): an accepted, independently verified candidate.
+- **`resource_limited`**: the run hit a resource budget (budget exhaustion,
+  failed experiments at the per-experiment time budget).
+- **`unresolved`** (default): still being worked on.
+
+Transitions are journaled as `problem_transition` events; `pro2 status` and
+`pro2 report` show per-problem status counts.
+
 ## Install
 
 ```bash
@@ -237,7 +250,9 @@ where present). Policy:
 
 Known limits: `unshare` requires user namespaces; Docker requires a reachable
 daemon and image; the `http` provider cannot be isolated (no process
-boundary). See `docs/threat-model.md` for the full threat model.
+boundary). The unshare wrapper binds host toolchain dirs read-only so agents
+still run tools inside the namespace. See `docs/threat-model.md` for the full
+threat model.
 
 ## State layout
 
@@ -266,7 +281,7 @@ interrupted experiment is marked `interrupted` and cleaned by `pro2 resume`.
 ```
 pro2-agent/
 ├── src/pro2/                  # engine core — stdlib-only Python 3.12
-├── tests/                     # integration tests (pytest, 198)
+├── tests/                     # integration tests (pytest, 256)
 ├── docs/paper-algorithm.md    # verified paper-mechanism spec
 ├── docs/threat-model.md       # threat model and implemented controls
 ├── paper/                     # extracted paper: original.pdf, extracted/, figures/
@@ -286,7 +301,8 @@ Core modules in `src/pro2/`:
 | `config.py` | Objective config: metrics, budgets, constraints, agents, research, engineering, seeds |
 | `records.py`, `experiment.py` | Evidence, Experiment, EngineeringTrial records |
 | `problem.py`, `problem_state.py`, `candidate_solution.py`, `hypothesis.py` | Problem State, candidates, hypotheses; paper priority `Pri = belief/(attempts+1)` |
-| `runner.py` | Bounded subprocess execution (timeout/memory/stall/divergence, process-group kill) |
+| `problem.py` | Three-state Problem taxonomy: `resolved` (terminal, on accepted candidate), `resource_limited` (budget exhaustion), `unresolved`; evidence-backed transitions |
+| `runner.py` | Bounded subprocess execution (timeout/memory/stall/divergence, process-group kill) in isolation-wrapped form |
 | `git_sandbox.py` | Worktrees, branches, rollback, `refs/pro2/best`, protected paths |
 | `verification.py` | Independent verification in a fresh worktree (tests + metric) |
 | `agents.py` | Provider-agnostic agent layer + machine-readable prompts |
@@ -302,7 +318,7 @@ Core modules in `src/pro2/`:
 ## Development
 
 ```bash
-uv run pytest -q          # 198 tests
+uv run pytest -q          # 256 tests
 uv run ruff check .       # lint
 uv run ruff format .      # format
 just check                # lint + tests

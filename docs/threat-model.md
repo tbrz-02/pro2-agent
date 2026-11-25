@@ -29,9 +29,12 @@ is hostile (it edits arbitrary files, rewrites tests, edits the verify command).
 Controls:
 
 - **Isolation** — `security.py` (`enforce_isolation`, `scrub_environment`):
-  agents run inside a namespace/container boundary (`unshare -rm` with bind
-  mounts, or Docker with `--network none`, `--read-only`, `--cap-drop ALL`).
-  See T7 for the fail-closed policy.
+  agents run inside a namespace/container boundary: `unshare -r -m [-n]`
+  (network denied → `-n`; host toolchain dirs and credential paths are
+  read-only binds) or Docker with `--network none`, `--read-only`,
+  `--cap-drop ALL`, `--pids-limit`, writable worktree volume. `bwrap`
+  (`--ro-bind /`, writable worktree, `--unshare-net`) and `nsjail
+  (--user 65534)` are used where present. See T7 for the fail-closed policy.
 - **Single-variable gate** — reviewer (agent + hard heuristic constraints:
   `optimizer`/`_heuristic_review`): protected paths, forbidden paths,
   test-file policy, diff budgets.
@@ -56,9 +59,8 @@ Agents have shells. Controls:
 - **Credential paths** — `credential_paths` identifies `~/.ssh`, `~/.aws`,
   `~/.gnupg`, `~/.kube`, `~/.netrc`, `~/.docker`, `~/.gcloud`, `~/.azure`;
   `security.credential_protection` documents the intent, and isolation
-  backends hide these paths (Docker mounts nothing but the project tree;
-  `unshare` worktrees can additionally bind `/dev/null` over them via
-  `credential_paths` consumption by operators).
+  backends mount these paths read-only in addition to the (read-only)
+  toolchain binds (`unshare` body, Docker `-v ...:ro`, bwrap `--ro-bind`).
 - **No network when denied** — see T7.
 - **No agent-given output trusted blindly** — all agent JSON is parsed by
   `parse_json_response` (fenced/first-JSON extraction), and every decision
@@ -152,6 +154,49 @@ for the current limits:
   primary source (`_verify_finding`); unverified findings are never attached
   as candidates.
 
+### T10 — Three-state Problem taxonomy (`unresolved` / `resource_limited` / `resolved`)
+
+- `Problem.set_status` validates transitions and records evidence-backed
+  `status_reasons` entries; `resolved` is terminal.
+- Transitions are journaled as `problem_transition` events and settle on
+  evidence: `resolved` on an accepted candidate (`Engine._run_hypothesis`),
+  `resource_limited` at budget exhaustion (`Engine.run` →
+  `Engine._settle_problems`) or when a failed experiment hits the per-experiment
+  time budget (`Engine._runaway_check`).
+- `select_hypothesis` deprioritizes hypotheses of resolved problems when other
+  work remains (`Engine._step_locked`).
+
+### T11 — Noise-aware evaluation and acceptance
+
+- `MetricMeasurement.stats` records `count/mean/std/min/max` of repeated runs
+  (`verification._measurement_stats`); `compare_metrics` accepts
+  `candidate_std` and `noise_weight` so acceptance requires
+  `delta >= min_delta + noise_weight * std` (`verification.compare_metrics`,
+  wired via `MetricSpec.noise_weight` into `verify_commit`).
+- Repeated runs are the same command repeated `MetricSpec.repeat` times;
+  baseline measurements also use `measure_metric` (median of repeats).
+
+### T12 — Research provenance extensions
+
+- `ResearchFinding` carries `doi`, `commit_hash` (versioned arXiv id or GitHub
+  repo SHA), and `excerpt` (primary-source excerpt) in addition to
+  `fetch_url`/`fetch_digest`.
+- DOIs are extracted from arXiv entries (`parse_arxiv`) and verified via
+  `doi.org` then Crossref (`ResearchEngine._verify_doi`); contradictions
+  downgrade the finding (`ResearchEngine.search` with `verify_primary=True`).
+- `ResearchEngine._verify_finding` reads and matches the primary source
+  (GitHub: repo + `commits/HEAD` SHA; arXiv: title + versioned id).
+
+### T13 — PI supervision fail-closed
+
+- `Engine.supervise()` counts unavailable PI supervisors
+  (`EngineState.pi_unavailable`) and journals `escalation` events;
+  `Engine._escalation_threshold_reached` pauses the run at
+  `Engine.MAX_PI_MALFORMED` (3) unavailability (or ambiguity) for human triage.
+- Resume during engineering: `Engine.run` re-enters `run_engineering()` when
+  `state.phase == "engineering"`; `Engine.recover` marks running/pending
+  engineering trials and MCTS nodes `interrupted`.
+
 ## Trust boundaries (summary)
 
 | Data | Authority | If compromised |
@@ -159,9 +204,10 @@ for the current limits:
 | Objective config (`pro2.json`) | Maker (developer) | Evaluator pin + `_assert_integrity` |
 | Hypothesis/patch text from agent | Untrusted (target) | Reviewer, fingerprint, isolation |
 | Target repo contents | Untrusted | Isolation, diff, protected paths |
-| Research findings | Best-effort evidence | Primary-source verification (T3) |
+| Research findings | Best-effort evidence | Primary-source verification (T3), DOI verification (T12) |
 | Experience Bank | Certified by engine | certification + confidence (T8) |
 | Event journal / state | Engine | atomic writes, backup, lock (T5) |
+| Problem State | Engine | three-state taxonomy (T10) |
 
 ## Known limits (documented honestly)
 
@@ -169,7 +215,14 @@ for the current limits:
   when it is, `auto` falls back to `docker` for `network=deny`, and if
   neither is usable, execution fails closed.
 - The `http` provider is not isolatable.
-- Docker isolation runs a minimal `alpine` wrapper; the process boundary is
-  as strong as the backend, not a dedicated seccomp/apparmor profile.
+- `backend: "none"` is an explicit opt-out: the command runs unwrapped (the
+  operator asked for no boundary); `auto` never selects it.
+- Docker isolation runs the wrapper as root with `--read-only` rootfs +
+  `--cap-drop ALL`; isolation strength is the backend's, not a dedicated
+  seccomp/apparmor profile.
+- The `unshare` backend binds host toolchain dirs read-only; the sandboxed
+  process can write inside the experiment worktree (see Known limits above).
+  A pivot_root into the worktree is not implemented; hardening is marked
+  ENGINEERING there.
 - Divergence detection and the sandbox fingerprint are heuristics on sampled
   output (`stall_seconds`/loop polling), not proofs.

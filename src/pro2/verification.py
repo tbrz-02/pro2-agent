@@ -19,15 +19,23 @@ class MetricMeasurement:
     runs: list[RunResult] = field(default_factory=list)
     values: list[float] = field(default_factory=list)
     error: str | None = None
+    # Repeated-run statistics (noise-aware acceptance uses these).
+    stats: dict[str, Any] = field(default_factory=dict)
 
     @property
     def run(self) -> RunResult | None:
         return self.runs[-1] if self.runs else None
 
+    @property
+    def std(self) -> float:
+        value = self.stats.get("std")
+        return float(value) if isinstance(value, (int, float)) else 0.0
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "value": self.value,
             "values": list(self.values),
+            "stats": dict(self.stats),
             "error": self.error,
             "runs": [
                 {
@@ -56,6 +64,7 @@ class VerificationResult:
     tests: list[RunResult] = field(default_factory=list)
     tests_failed: bool = False
     error: str = ""
+    stats: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -67,6 +76,7 @@ class VerificationResult:
             "measurement": self.measurement.to_dict(),
             "tests_failed": self.tests_failed,
             "error": self.error,
+            "stats": dict(self.stats),
             "tests": [
                 {
                     "command": r.command,
@@ -79,6 +89,20 @@ class VerificationResult:
                 for r in self.tests
             ],
         }
+
+
+def _measurement_stats(values: list[float]) -> dict[str, Any]:
+    """Repeated-run statistics: mean, sample/population std, min, max, count."""
+    if not values:
+        return {"count": 0}
+    std = statistics.pstdev(values) if len(values) > 1 else 0.0
+    return {
+        "count": len(values),
+        "mean": statistics.fmean(values),
+        "std": std,
+        "min": min(values),
+        "max": max(values),
+    }
 
 
 def measure_metric(
@@ -132,9 +156,15 @@ def measure_metric(
             value=None,
             runs=runs,
             error=f"could not extract finite metric: {detail}".strip(),
+            stats=_measurement_stats([]),
         )
 
-    return MetricMeasurement(value=statistics.median(values), runs=runs, values=values)
+    return MetricMeasurement(
+        value=statistics.median(values),
+        runs=runs,
+        values=values,
+        stats=_measurement_stats(values),
+    )
 
 
 def compare_metrics(
@@ -143,7 +173,15 @@ def compare_metrics(
     direction: str,
     min_delta: float,
     target: float | None = None,
+    candidate_std: float = 0.0,
+    noise_weight: float = 0.0,
 ) -> tuple[bool, float, str]:
+    """Compare candidate vs baseline with noise-aware acceptance.
+
+    Acceptance requires `delta >= min_delta + noise_weight * candidate_std`
+    (default noise_weight=0 reproduces the plain paper rule). Also honors
+    the absolute target for both directions.
+    """
     if direction == "maximize":
         delta = candidate - baseline
         target_ok = target is None or candidate >= target
@@ -151,14 +189,15 @@ def compare_metrics(
         delta = baseline - candidate
         target_ok = target is None or candidate <= target
 
-    accepted = delta >= min_delta and target_ok
+    threshold = min_delta + max(0.0, noise_weight) * max(0.0, candidate_std)
+    accepted = delta >= threshold and target_ok
     if accepted:
         reason = f"improved by {delta:.6g} (baseline={baseline:.6g}, candidate={candidate:.6g})"
     elif not target_ok:
         reason = f"candidate {candidate:.6g} did not reach target {target:.6g}; delta={delta:.6g}"
     else:
         reason = (
-            f"insufficient improvement: delta={delta:.6g} < required {min_delta:.6g} "
+            f"insufficient improvement: delta={delta:.6g} < required {threshold:.6g} "
             f"(baseline={baseline:.6g}, candidate={candidate:.6g})"
         )
     return accepted, delta, reason
@@ -230,8 +269,10 @@ def verify_commit(
             direction=objective.success.direction,
             min_delta=objective.success.min_delta if min_delta is None else min_delta,
             target=objective.success.target if target is None else target,
+            candidate_std=measurement.std,
+            noise_weight=objective.verify.noise_weight,
         )
-        return VerificationResult(
+        result = VerificationResult(
             accepted=accepted,
             baseline_metric=baseline_metric,
             candidate_metric=measurement.value,
@@ -240,6 +281,9 @@ def verify_commit(
             measurement=measurement,
             tests=tests,
         )
+        if measurement.stats:
+            result.stats = measurement.stats
+        return result
     except Exception as exc:  # verification must never crash the engine
         return VerificationResult(
             accepted=False,

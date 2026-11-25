@@ -56,6 +56,7 @@ class EngineState(ProblemState):
     escalations: list[dict[str, Any]] = field(default_factory=list)
     reviewer_unavailable: int = 0
     pi_malformed: int = 0
+    pi_unavailable: int = 0
     stop_reason: str = ""
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
@@ -103,6 +104,7 @@ class EngineState(ProblemState):
                 "escalations": [dict(e) for e in self.escalations],
                 "reviewer_unavailable": self.reviewer_unavailable,
                 "pi_malformed": self.pi_malformed,
+                "pi_unavailable": self.pi_unavailable,
                 "stop_reason": self.stop_reason,
                 "created_at": self.created_at,
                 "updated_at": self.updated_at,
@@ -142,6 +144,7 @@ class EngineState(ProblemState):
             escalations=[dict(e) for e in data.get("escalations", [])],
             reviewer_unavailable=int(data.get("reviewer_unavailable", 0)),
             pi_malformed=int(data.get("pi_malformed", 0)),
+            pi_unavailable=int(data.get("pi_unavailable", 0)),
             stop_reason=str(data.get("stop_reason", "")),
             created_at=str(data.get("created_at", utc_now())),
             updated_at=str(data.get("updated_at", utc_now())),

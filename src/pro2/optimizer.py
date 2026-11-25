@@ -41,6 +41,9 @@ class MCTSNode:
     duration_seconds: float = 0.0
     commit: str | None = None
     status: str = "pending"
+    # Only nodes whose trial actually improved the root metric are eligible
+    # for `best()`; failed/pending/rejected trials never win.
+    accepted: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -54,6 +57,7 @@ class MCTSNode:
             "duration_seconds": self.duration_seconds,
             "commit": self.commit,
             "status": self.status,
+            "accepted": self.accepted,
         }
 
     @classmethod
@@ -73,6 +77,7 @@ class MCTSNode:
             duration_seconds=float(data.get("duration_seconds", 0.0)),
             commit=data.get("commit"),
             status=str(data.get("status", "pending")),
+            accepted=bool(data.get("accepted", False)),
         )
 
 
@@ -184,12 +189,14 @@ class EngineeringOptimizer:
         metric: float | None,
         commit: str | None = None,
         status: str = "completed",
+        accepted: bool = True,
     ) -> float:
         node = self.nodes[node_id]
         node.metric = metric
         node.duration_seconds = duration_seconds
         node.commit = commit
         node.status = status
+        node.accepted = accepted and status == "completed"
         node.visits += 1
         if status == "failed":
             # Paper: failed branches are purged (hard rollback); no reward is
@@ -206,7 +213,9 @@ class EngineeringOptimizer:
         return value
 
     def best(self) -> MCTSNode:
-        candidates = [n for n in self.nodes.values() if n.metric is not None]
+        # Only completed, accepted trials (metric set and improved the root)
+        # are eligible: failed/pending/rejected branches never win.
+        candidates = [n for n in self.nodes.values() if n.metric is not None and n.accepted]
         if not candidates:
             return self.nodes[self.root_id]
         if self.direction == "minimize":

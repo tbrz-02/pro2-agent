@@ -180,9 +180,11 @@ def run_command(
             error=f"working directory does not exist: {cwd_path}",
         )
 
+    shell = isinstance(command, str)
     if isolation is not None and isolation.enabled:
-        command, _scrub_env = enforce_isolation(isolation, command, cwd_path)
+        command, _ = enforce_isolation(isolation, command, cwd_path)
         merged_env = scrub_environment(os.environ)
+        shell = False
     else:
         merged_env = os.environ.copy()
     merged_env.setdefault("PYTHONUNBUFFERED", "1")
@@ -194,7 +196,7 @@ def run_command(
         process = subprocess.Popen(
             command,
             cwd=str(cwd_path),
-            shell=isinstance(command, str),
+            shell=shell,
             stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

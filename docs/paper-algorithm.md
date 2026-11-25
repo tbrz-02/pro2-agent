@@ -357,6 +357,48 @@ under `tests/`):
   `tests/test_integrity.py`, `tests/test_scientific_search.py`,
   `tests/test_review_governance.py`, `tests/test_resource_governance.py`.
 
+Implemented in this round (paper-fidelity gaps):
+
+- **Three-state Problem taxonomy (DERIVED)** — `Problem.status` ∈
+  {`unresolved` (default), `resource_limited`, `resolved`}; evidence-backed
+  transitions recorded in `Problem.status_reasons` + journaled
+  `problem_transition` events: `resolved` on an accepted candidate
+  (`Engine._run_hypothesis`), `resource_limited` at budget exhaustion
+  (`Engine.run` → `Engine._settle_problems`) and on failed experiments at the
+  per-experiment time budget (`Engine._runaway_check`). `resolved` is
+  terminal; `select_hypothesis` deprioritizes resolved problems while other
+  work remains.
+- **MCTS/UCT fidelity (DERIVED)** — `MCTSNode.accepted`; `record_result`
+  backpropagates reward to ancestors (incl. root); `best()` selects only
+  completed, accepted nodes — failed/pending/interrupted/rejected never win;
+  `EngineeringOptimizer` persists the full tree with direction in
+  `state.engineering` and `Engine.run` re-enters `run_engineering()` when
+  resuming mid-engineering (`tests/test_mcts_fidelity.py`).
+- **Noise-aware evaluation (ENGINEERING)** — `MetricMeasurement.stats`
+  (count/mean/std/min/max), `compare_metrics(candidate_std, noise_weight)`
+  (acceptance requires `delta >= min_delta + noise_weight * std`; default 0
+  preserves paper semantics), wired via `MetricSpec.noise_weight` into
+  `verify_commit` (`tests/test_noise_aware.py`).
+- **Research verification extensions (DERIVED/ENGINEERING)** — `ResearchFinding`
+  now carries `doi`, `commit_hash` (versioned arXiv id / GitHub SHA) and
+  `excerpt`; `parse_arxiv` extracts DOIs; `ResearchEngine._verify_doi`
+  verifies DOIs via doi.org/Crossref; `_verify_finding` reads the primary
+  source and records commit hashes/excerpts (`tests/test_research_provenance.py`).
+- **Experience Bank extensions (ENGINEERING)** — `ExperienceEntry.observation`,
+  `causal_hypothesis`, `verified_fix`, `reproducible`, `evidence_refs`;
+  `format_for_prompt` renders them; `Engine._record_experience` populates them
+  (`tests/test_experience_rich.py`).
+- **Sandbox hardening (ENGINEERING)** — `unshare` wrapper adds `-n` for
+  network denial, binds host toolchain dirs read-only, and credential paths
+  read-only; `docker` mounts the worktree writable (`-v path:path`), rootfs
+  `--read-only` + `--cap-drop ALL` + `--network none` + `--pids-limit`; `bwrap`
+  keeps `/` read-only and binds the worktree; `nsjail` runs as `--user 65534`;
+  string commands are normalized in `enforce_isolation` (fixing a broken
+  argv concat for string-command metrics).
+- **PI governance (ENGINEERING)** — supervisor unavailability is counted
+  (`EngineState.pi_unavailable`), journaled, and escalates at
+  `Engine.MAX_PI_MALFORMED = 3` (`tests/test_governance.py`).
+
 Resolved before coding: Problem State schema, belief deltas, δ_target,
 hypothesis lifecycle, UCT equation (§2–§4 PAPER entries).
 
@@ -397,6 +439,10 @@ Summary of the threat surface and its controls:
 | T7 | Isolation unavailability | fail-closed `IsolationError`; `pro2 doctor` reports backends |
 | T8 | Experience Bank poisoning | certification + confidence, certified-only retrieval |
 | T9 | Misleading science outputs | primary-source verification of findings, normalized signatures |
+| T10 | Three-state Problem taxonomy | `unresolved`/`resource_limited`/`resolved` transitions with evidence (`problem.py`, `Engine._settle_problems`, `Engine._runaway_check`) |
+| T11 | Noise-aware evaluation | repeated-run stats + noise-aware acceptance (`verification.compare_metrics`, `MetricSpec.noise_weight`) |
+| T12 | Research provenance | DOI/commit-hash/excerpt preservation + verification (`research.py`) |
+| T13 | PI supervision fail-closed | `EngineState.pi_unavailable`, escalation at `Engine.MAX_PI_MALFORMED` |
 
 Full detail: `docs/threat-model.md` (threats, controls, trust boundaries,
 documented limits).

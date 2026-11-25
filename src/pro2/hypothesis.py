@@ -155,18 +155,26 @@ def select_hypothesis(
     queue: Iterable[Hypothesis],
     beliefs: dict[str, float],
     attempts: dict[str, int],
+    resolved_problems: set[str] | None = None,
 ) -> Hypothesis | None:
     """Select the highest-priority pending hypothesis.
 
     Tie-break is deterministic and independent of input ordering: higher
     hypothesis id wins. This keeps replays reproducible after state reload.
+    Hypotheses whose problem is in `resolved_problems` are deprioritized so
+    solved problems are not re-attempted while work remains elsewhere.
     """
     pending = [h for h in queue if h.status == "pending"]
     if not pending:
         return None
+    resolved = resolved_problems or set()
 
-    def key(h: Hypothesis) -> tuple[float, str]:
+    def key(h: Hypothesis) -> tuple[int, float, str]:
         belief = beliefs.get(h.candidate_id, 0.0)
-        return (hypothesis_priority(belief, attempts.get(h.problem_id, 0)), h.hypothesis_id)
+        return (
+            1 if h.problem_id in resolved else 0,
+            hypothesis_priority(belief, attempts.get(h.problem_id, 0)),
+            h.hypothesis_id,
+        )
 
     return max(pending, key=key)

@@ -2,6 +2,8 @@
 
 Fail-safe design: when isolation is enabled and no backend is available,
 agent execution raises IsolationError instead of running unprotected.
+Backends: unshare (mount namespaces; writable experiment worktree), docker
+(full container), bwrap and nsjail where present.
 """
 
 from __future__ import annotations
@@ -22,6 +24,20 @@ SECRET_ENV_PATTERN = re.compile(
 )
 
 CREDENTIAL_DIRS = ("ssh", "aws", "gnupg", "kube", "netrc", "docker", "gcloud", "azure")
+
+# Toolchain directories bind-mounted read-only so the sandboxed process can
+# still run the project's tools (no pivot_root available on every host).
+_TOOLCHAIN_DIRS = (
+    "/usr/bin",
+    "/usr/sbin",
+    "/usr/lib",
+    "/usr/lib/x86_64-linux-gnu",
+    "/usr/lib64",
+    "/usr/lib/python3.12",
+    "/usr/share",
+    "/etc",
+    "/opt",
+)
 
 
 class IsolationError(RuntimeError):
@@ -79,6 +95,9 @@ def select_backend(config: SecurityConfig) -> str | None:
     """Choose an available backend for the config; None when none is usable."""
     if not config.enabled:
         return None
+    if config.backend == "none":
+        # Explicit opt-out: the operator asked for no boundary.
+        return None
     if config.backend not in {"auto", "none"}:
         return config.backend if detect_backends().get(config.backend) else None
     available = detect_backends()
@@ -103,16 +122,32 @@ def scrub_environment(env: dict[str, str] | None) -> dict[str, str]:
     return {k: v for k, v in (env or {}).items() if not SECRET_ENV_PATTERN.search(k)}
 
 
-def _build_unshare_wrapper(command: list[str], readonly_dirs: list[str]) -> list[str]:
-    body = ["set -e"]
-    for path in readonly_dirs:
-        body.append(f'mount --bind "{path}" "{path}" 2>/dev/null')
-        body.append(f'mount -o remount,bind,ro "{path}" 2>/dev/null')
-    body.append('exec "$@"')
-    return ["unshare", "-r", "-m", "sh", "-c", "\n".join(body), "sh", *command]
+def _normalize(command: list[str] | str) -> list[str]:
+    return [command] if isinstance(command, str) else list(command)
 
 
-def _build_docker_wrapper(command: list[str], readonly_dirs: list[str]) -> list[str]:
+def _wrap_exec(body: str, command: list[str]) -> list[str]:
+    return ["sh", "-c", body, "sh", *command]
+
+
+def _build_unshare_wrapper(
+    command: list[str], cwd: str, readonly_dirs: list[str], network_deny: bool
+) -> list[str]:
+    args = ["unshare", "-r", "-m"]
+    if network_deny:
+        args.append("-n")
+    body_lines = ["set -e", f'cd "{cwd}"']
+    # Host toolchain is bind-mounted read-only: agents still have the tools.
+    # Binds are best-effort: some hosts refuse some mounts; the command still
+    # runs without them.
+    for path in list(_TOOLCHAIN_DIRS) + readonly_dirs + credential_paths():
+        body_lines.append(f'mount --bind "{path}" "{path}" 2>/dev/null || true')
+        body_lines.append(f'mount -o remount,bind,ro "{path}" 2>/dev/null || true')
+    body_lines.append('exec "$@"')
+    return [*args, *_wrap_exec("\n".join(body_lines), command)]
+
+
+def _build_docker_wrapper(command: list[str], cwd: str, readonly_dirs: list[str]) -> list[str]:
     run = [
         "docker",
         "run",
@@ -120,69 +155,80 @@ def _build_docker_wrapper(command: list[str], readonly_dirs: list[str]) -> list[
         "--network",
         "none",
         "--user",
-        "65534",
+        "0",  # worktree is mounted rw; rootfs is ro + no caps
         "--cap-drop",
         "ALL",
         "--read-only",
+        "--pids-limit",
+        "256",
     ]
-    for path in readonly_dirs:
+    for path in readonly_dirs + credential_paths():
         run.extend(["-v", f"{path}:{path}:ro"])
-    run.extend(["alpine:latest", "sh", "-c", 'exec "$@"', "sh", *command])
+    run.extend(["-v", f"{cwd}:{cwd}"])
+    run.extend(["alpine:latest"])
+    run.extend(_wrap_exec('exec "$@"', command))
     return run
+
+
+def _build_bwrap_wrapper(
+    command: list[str], cwd: str, readonly_dirs: list[str], network_deny: bool
+) -> list[str]:
+    wrapped = ["bwrap", "--unshare-all", "--die-with-parent", "--dev", "/dev", "--proc", "/proc"]
+    if network_deny:
+        wrapped.append("--unshare-net")
+    wrapped.append("--ro-bind")
+    wrapped.extend(["/", "/"])
+    # The experiment worktree is the only writable path into the sandbox.
+    wrapped.append("--bind")
+    wrapped.extend([cwd, cwd])
+    for path in readonly_dirs + credential_paths():
+        wrapped.extend(["--ro-bind", path, path])
+    wrapped.extend(["--", *command])
+    return wrapped
+
+
+def _build_nsjail_wrapper(command: list[str]) -> list[str]:
+    return ["nsjail", "--user", "65534", "--", *command]
 
 
 def enforce_isolation(
     config: SecurityConfig,
-    command: list[str],
+    command: list[str] | str,
     cwd: str | Path,
     readonly_dirs: list[str] | None = None,
 ) -> tuple[list[str], dict[str, str]]:
     """Wrap a command so it runs inside an isolation boundary.
 
-    Returns (wrapped_command, scrubbed_env). Raises IsolationError when
-    isolation is enabled but no usable backend is available (fail-closed).
+    Returns (wrapped_command, scrubbed_env). Explicit backend "none" or a
+    disabled policy returns the command unwrapped; when isolation is enabled
+    but no usable backend is available it raises IsolationError (fail-closed).
     """
-    if not config.enabled:
+    command = _normalize(command)
+    if not config.enabled or config.backend == "none":
         return list(command), scrub_environment(os.environ)
     backend = select_backend(config)
     if backend is None:
         raise IsolationError(
             "isolation is enabled but no backend is available "
-            f"(probed: {sorted(detect_backends())}); install unshare/bwrap/nsjail/docker "
+            f"(probed: {sorted(detect_backends())}); install unshare/docker/bwrap/nsjail "
             "or set security.enabled=false"
         )
-    if config.network == "deny" and backend == "unshare" and not detect_backends()["unshare_net"]:
-        raise IsolationError("isolation network=deny requires `unshare -n`, unavailable")
 
-    readonly = list(readonly_dirs or [])
-    cwd_path = Path(cwd).resolve()
-    if str(cwd_path) not in readonly:
-        readonly.append(str(cwd_path))
+    cwd_path = str(Path(cwd).resolve())
+    readonly = [p for p in (readonly_dirs or []) if p and p != cwd_path]
+    readonly += [p for p in credential_paths() if p not in readonly and p != cwd_path]
+    network_deny = config.network == "deny"
 
     if backend == "unshare":
-        wrapped = _build_unshare_wrapper(command, readonly)
+        wrapped = _build_unshare_wrapper(command, cwd_path, readonly, network_deny)
     elif backend == "docker":
-        wrapped = _build_docker_wrapper(command, readonly)
+        wrapped = _build_docker_wrapper(command, cwd_path, readonly)
     elif backend == "bwrap":
-        wrapped = [
-            "bwrap",
-            "--unshare-all",
-            "--die-with-parent",
-            "--dev",
-            "/dev",
-            "--proc",
-            "/proc",
-            "--ro-bind",
-            "/",
-            "/",
-            *(item for path in readonly for item in ("--ro-bind", path, path)),
-            "--",
-            *command,
-        ]
+        wrapped = _build_bwrap_wrapper(command, cwd_path, readonly, network_deny)
     elif backend == "nsjail":
-        wrapped = ["nsjail", "--", *command]
-    else:  # none
-        wrapped = list(command)
+        wrapped = _build_nsjail_wrapper(command)
+    else:
+        wrapped = command
     return wrapped, scrub_environment(os.environ)
 
 
